@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import { prisma } from '../config/database';
+import { db, prisma } from '../config/database';
 import { config } from '../config/config';
 import { AppError, ConflictError, UnauthorizedError, NotFoundError } from '../utils/errors';
 import { sendSuccess, sendCreated } from '../utils/response';
@@ -195,32 +195,24 @@ export class AuthController {
   static async me(req: Request, res: Response, next: NextFunction) {
     try {
       const userId = req.user!.userId;
-      const user = await prisma.user.findUnique({
-        where: { id: userId },
-        select: {
-          id: true,
-          email: true,
-          role: true,
-          isActive: true,
-          isEmailVerified: true,
-          lastLoginAt: true,
-          createdAt: true,
-          staff: {
-            select: {
-              id: true, staffId: true, firstName: true, lastName: true,
-              profilePhoto: true, department: { select: { name: true } },
-              doctor: { select: { id: true, licenseNumber: true, specialization: { select: { name: true } } } },
-              nurse: { select: { id: true, licenseNumber: true } },
-            },
-          },
-          patient: {
-            select: {
-              id: true, patientId: true, firstName: true, lastName: true,
-              profilePhoto: true, bloodGroup: true,
-            },
-          },
-        },
-      });
+      const user = await db.orm.public.User
+        .select('id', 'email', 'role', 'isActive', 'isEmailVerified', 'lastLoginAt', 'createdAt')
+        .include('staff', (staff) =>
+          staff
+            .select('id', 'staffId', 'firstName', 'lastName', 'profilePhoto')
+            .include('department', (department) => department.select('name'))
+            .include('doctor', (doctor) =>
+              doctor
+                .select('id', 'licenseNumber')
+                .include('specialization', (specialization) => specialization.select('name'))
+            )
+            .include('nurse', (nurse) => nurse.select('id', 'licenseNumber'))
+        )
+        .include('patient', (patient) =>
+          patient.select('id', 'patientId', 'firstName', 'lastName', 'profilePhoto', 'bloodGroup')
+        )
+        .where({ id: userId })
+        .first();
 
       if (!user) throw new NotFoundError('User not found');
       return sendSuccess(res, user);

@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
-import { prisma } from '../config/database';
+import { db } from '../config/database';
 import { JwtPayload } from './auth.middleware';
 
 export const auditLog = (action: string, resource: string) => {
@@ -28,8 +28,7 @@ export const logAudit = async (
   userAgent?: string
 ) => {
   try {
-    await prisma.auditLog.create({
-      data: {
+    await db.orm.public.AuditLog.create({
         userId,
         action,
         resource,
@@ -38,7 +37,6 @@ export const logAudit = async (
         newValue: newValue ? JSON.parse(JSON.stringify(newValue)) : undefined,
         ipAddress,
         userAgent,
-      },
     });
   } catch (error) {
     console.error('Audit log error:', error);
