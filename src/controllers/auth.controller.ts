@@ -1,13 +1,17 @@
 import { Request, Response, NextFunction } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import { db, prisma } from '../config/database';
+import { db } from '../config/database';
 import { config } from '../config/config';
 import { AppError, ConflictError, UnauthorizedError, NotFoundError } from '../utils/errors';
 import { sendSuccess, sendCreated } from '../utils/response';
 import { generateToken } from '../utils/helpers';
 import { Role } from '@prisma/client';
+import type { TimestampString } from '@prisma/orm-postgres/target/codec-types';
 import { logAudit } from '../middleware/audit.middleware';
+
+const toTimestampString = (date: Date): TimestampString<3> =>
+  date.toISOString() as TimestampString<3>;
 
 const signAccessToken = (userId: string, role: Role, email: string): string =>
   jwt.sign({ userId, role, email }, config.jwt.secret, {
@@ -26,29 +30,21 @@ export class AuthController {
    */
   static async register(req: Request, res: Response, next: NextFunction) {
     try {
-      const { email, password, role = Role.PATIENT } = req.body;
+      const { email, password } = req.body;
+      const role = Role.PATIENT;
 
-      const existing = await prisma.user.findUnique({ where: { email } });
+      const existing = await db.orm.public.User.where({ email }).first();
       if (existing) throw new ConflictError('Email already in use');
 
       const hashed = await bcrypt.hash(password, config.bcrypt.rounds);
       const verifyToken = generateToken();
 
-      const user = await prisma.user.create({
-        data: {
+      const user = await db.orm.public.User.create({
           email,
           password: hashed,
           role,
           emailVerifyToken: verifyToken,
-        },
-        select: {
-          id: true,
-          email: true,
-          role: true,
-          isEmailVerified: true,
-          createdAt: true,
-        },
-      });
+        });
 
       await logAudit(user.id, 'REGISTER', 'user', user.id, null, { email, role });
 
@@ -65,17 +61,10 @@ export class AuthController {
     try {
       const { email, password } = req.body;
 
-      const user = await prisma.user.findUnique({
-        where: { email },
-        select: {
-          id: true,
-          email: true,
-          password: true,
-          role: true,
-          isActive: true,
-          isEmailVerified: true,
-        },
-      });
+      const user = await db.orm.public.User
+        .select('id', 'email', 'password', 'role', 'isActive', 'isEmailVerified')
+        .where({ email })
+        .first();
 
       if (!user || !(await bcrypt.compare(password, user.password))) {
         throw new UnauthorizedError('Invalid email or password');
@@ -92,18 +81,13 @@ export class AuthController {
       const refreshExpiry = new Date();
       refreshExpiry.setDate(refreshExpiry.getDate() + 30);
 
-      await prisma.refreshToken.create({
-        data: {
+      await db.orm.public.RefreshToken.create({
           token: refreshToken,
           userId: user.id,
-          expiresAt: refreshExpiry,
-        },
+            expiresAt: toTimestampString(refreshExpiry),
       });
 
-      await prisma.user.update({
-        where: { id: user.id },
-        data: { lastLoginAt: new Date() },
-      });
+          await db.orm.public.User.where({ id: user.id }).update({ lastLoginAt: toTimestampString(new Date()) });
 
       await logAudit(user.id, 'LOGIN', 'user', user.id, null, null, req.ip, req.headers['user-agent']);
 
@@ -136,12 +120,13 @@ export class AuthController {
         throw new UnauthorizedError('Invalid or expired refresh token');
       }
 
-      const stored = await prisma.refreshToken.findUnique({
-        where: { token: refreshToken },
-        include: { user: true },
-      });
+      const stored = await db.orm.public.RefreshToken
+        .select('id', 'token', 'userId', 'expiresAt')
+        .include('user', (user) => user.select('id', 'email', 'role', 'isActive'))
+        .where({ token: refreshToken })
+        .first();
 
-      if (!stored || stored.expiresAt < new Date()) {
+      if (!stored || !stored.user || new Date(stored.expiresAt) < new Date()) {
         throw new UnauthorizedError('Refresh token expired or not found');
       }
 
@@ -150,20 +135,19 @@ export class AuthController {
       }
 
       // Rotate refresh token
-      await prisma.refreshToken.delete({ where: { id: stored.id } });
-
       const newRefreshExpiry = new Date();
       newRefreshExpiry.setDate(newRefreshExpiry.getDate() + 30);
 
       const newRefreshToken = signRefreshToken(stored.userId);
       const newAccessToken = signAccessToken(stored.user.id, stored.user.role, stored.user.email);
 
-      await prisma.refreshToken.create({
-        data: {
+      await db.transaction(async (tx) => {
+        await tx.orm.public.RefreshToken.where({ id: stored.id }).delete();
+        await tx.orm.public.RefreshToken.create({
           token: newRefreshToken,
           userId: stored.userId,
-          expiresAt: newRefreshExpiry,
-        },
+          expiresAt: toTimestampString(newRefreshExpiry),
+        });
       });
 
       return sendSuccess(res, {
@@ -181,7 +165,7 @@ export class AuthController {
     try {
       const { refreshToken } = req.body;
       if (refreshToken) {
-        await prisma.refreshToken.deleteMany({ where: { token: refreshToken } });
+        await db.orm.public.RefreshToken.where({ token: refreshToken }).deleteAndCount();
       }
       return sendSuccess(res, null, 'Logged out successfully');
     } catch (error) {
@@ -229,17 +213,17 @@ export class AuthController {
       const { currentPassword, newPassword } = req.body;
       const userId = req.user!.userId;
 
-      const user = await prisma.user.findUnique({ where: { id: userId } });
+      const user = await db.orm.public.User.select('id', 'password').where({ id: userId }).first();
       if (!user) throw new NotFoundError();
 
       const isMatch = await bcrypt.compare(currentPassword, user.password);
       if (!isMatch) throw new UnauthorizedError('Current password is incorrect');
 
       const hashed = await bcrypt.hash(newPassword, config.bcrypt.rounds);
-      await prisma.user.update({ where: { id: userId }, data: { password: hashed } });
-
-      // Invalidate all refresh tokens
-      await prisma.refreshToken.deleteMany({ where: { userId } });
+      await db.transaction(async (tx) => {
+        await tx.orm.public.User.where({ id: userId }).update({ password: hashed });
+        await tx.orm.public.RefreshToken.where({ userId }).deleteAndCount();
+      });
 
       await logAudit(userId, 'CHANGE_PASSWORD', 'user', userId);
 
@@ -255,16 +239,16 @@ export class AuthController {
   static async forgotPassword(req: Request, res: Response, next: NextFunction) {
     try {
       const { email } = req.body;
-      const user = await prisma.user.findUnique({ where: { email } });
+      const user = await db.orm.public.User.select('id').where({ email }).first();
 
       // Always return success to prevent user enumeration
       if (user) {
         const resetToken = generateToken();
         const expiry = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
 
-        await prisma.user.update({
-          where: { id: user.id },
-          data: { passwordResetToken: resetToken, passwordResetExpiry: expiry },
+        await db.orm.public.User.where({ id: user.id }).update({
+          passwordResetToken: resetToken,
+          passwordResetExpiry: toTimestampString(expiry),
         });
         // TODO: Send email with reset link
         console.log(`Password reset token for ${email}: ${resetToken}`);
@@ -283,26 +267,22 @@ export class AuthController {
     try {
       const { token, newPassword } = req.body;
 
-      const user = await prisma.user.findFirst({
-        where: {
-          passwordResetToken: token,
-          passwordResetExpiry: { gte: new Date() },
-        },
-      });
+      const user = await db.orm.public.User
+        .where({ passwordResetToken: token })
+        .where((user) => user.passwordResetExpiry.gte(toTimestampString(new Date())))
+        .first();
 
       if (!user) throw new AppError('Invalid or expired reset token', 400);
 
       const hashed = await bcrypt.hash(newPassword, config.bcrypt.rounds);
-      await prisma.user.update({
-        where: { id: user.id },
-        data: {
+      await db.transaction(async (tx) => {
+        await tx.orm.public.User.where({ id: user.id }).update({
           password: hashed,
           passwordResetToken: null,
           passwordResetExpiry: null,
-        },
+        });
+        await tx.orm.public.RefreshToken.where({ userId: user.id }).deleteAndCount();
       });
-
-      await prisma.refreshToken.deleteMany({ where: { userId: user.id } });
 
       return sendSuccess(res, null, 'Password reset successfully');
     } catch (error) {

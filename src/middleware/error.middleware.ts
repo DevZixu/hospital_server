@@ -55,6 +55,37 @@ export const errorHandler = (
     return;
   }
 
+  const databaseError = err as Error & {
+    code?: unknown;
+    sqlState?: unknown;
+    meta?: { target?: unknown };
+    details?: { sqlState?: unknown };
+  };
+  const sqlState = databaseError.sqlState ?? databaseError.details?.sqlState;
+  if (sqlState === '23505') {
+    res.status(409).json({ success: false, message: 'A record with this value already exists.' });
+    return;
+  }
+  if (sqlState === '23503') {
+    res.status(400).json({ success: false, message: 'Related record not found.' });
+    return;
+  }
+
+  if (typeof databaseError.code === 'string') {
+    if (databaseError.code === 'RUNTIME.NO_ROWS' || databaseError.code === 'ORM.MUTATION_ROW_MISSING') {
+      res.status(404).json({ success: false, message: 'Record not found' });
+      return;
+    }
+    if (databaseError.code === 'RUNTIME.ENCODE_FAILED' || databaseError.code === 'ORM.ARGUMENT_INVALID') {
+      res.status(400).json({
+        success: false,
+        message: 'Invalid data provided',
+        ...(config.env === 'development' && { detail: err.message }),
+      });
+      return;
+    }
+  }
+
   // JWT errors
   if (err.name === 'JsonWebTokenError') {
     res.status(401).json({ success: false, message: 'Invalid token' });

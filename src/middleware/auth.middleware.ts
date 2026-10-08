@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { config } from '../config/config';
-import { prisma } from '../config/database';
+import { db } from '../config/database';
 import { UnauthorizedError, ForbiddenError } from '../utils/errors';
 import { Role } from '@prisma/client';
 
@@ -33,10 +33,10 @@ export const authenticate = async (
     const token = authHeader.split(' ')[1];
     const payload = jwt.verify(token, config.jwt.secret) as JwtPayload;
 
-    const user = await prisma.user.findUnique({
-      where: { id: payload.userId },
-      select: { id: true, role: true, email: true, isActive: true },
-    });
+    const user = await db.orm.public.User
+      .select('id', 'role', 'email', 'isActive')
+      .where({ id: payload.userId })
+      .first();
 
     if (!user || !user.isActive) {
       throw new UnauthorizedError('Account not found or inactive');
@@ -79,10 +79,10 @@ export const optionalAuth = async (
     if (authHeader && authHeader.startsWith('Bearer ')) {
       const token = authHeader.split(' ')[1];
       const payload = jwt.verify(token, config.jwt.secret) as JwtPayload;
-      const user = await prisma.user.findUnique({
-        where: { id: payload.userId },
-        select: { id: true, role: true, email: true, isActive: true },
-      });
+      const user = await db.orm.public.User
+        .select('id', 'role', 'email', 'isActive')
+        .where({ id: payload.userId })
+        .first();
       if (user && user.isActive) {
         req.user = { userId: user.id, role: user.role, email: user.email };
       }
