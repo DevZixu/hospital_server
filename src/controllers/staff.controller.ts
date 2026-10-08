@@ -1,12 +1,20 @@
 import { Request, Response, NextFunction } from 'express';
 import bcrypt from 'bcryptjs';
-import { prisma } from '../config/database';
+import { db } from '../config/database';
+import { all, and, or } from '@prisma/orm-postgres/orm-client';
+import type { TimestampString } from '@prisma/orm-postgres/target/codec-types';
 import { config } from '../config/config';
 import { NotFoundError, ConflictError } from '../utils/errors';
 import { sendSuccess, sendCreated, getPaginationParams, buildPaginationMeta } from '../utils/response';
 import { generateStaffId } from '../utils/helpers';
 import { logAudit } from '../middleware/audit.middleware';
 import { Role } from '@prisma/client';
+
+const toTimestampString = (value: Date): TimestampString<3> =>
+  value.toISOString() as TimestampString<3>;
+
+const findStaff = (id: string) =>
+  db.orm.public.Staff.where((staff) => or(staff.id.eq(id), staff.staffId.eq(id))).first();
 
 export class StaffController {
   /**
@@ -26,66 +34,56 @@ export class StaffController {
         nurseType, wardId,
       } = req.body;
 
-      const existingUser = await prisma.user.findUnique({ where: { email } });
+      const existingUser = await db.orm.public.User.where({ email }).first();
       if (existingUser) throw new ConflictError('Email already in use');
 
       const staffId = generateStaffId();
       const hashedPass = await bcrypt.hash(password || `${firstName}@${new Date().getFullYear()}`, config.bcrypt.rounds);
 
-      const staff = await prisma.$transaction(async (tx) => {
-        const user = await tx.user.create({
-          data: { email, password: hashedPass, role },
-        });
+      const staff = await db.transaction(async (tx) => {
+        const user = await tx.orm.public.User.create({ email, password: hashedPass, role });
 
-        const staff = await tx.staff.create({
-          data: {
+        const createdStaff = await tx.orm.public.Staff.create({
             userId: user.id,
             staffId,
             firstName, lastName, middleName, gender,
-            dateOfBirth: new Date(dateOfBirth),
+            dateOfBirth: toTimestampString(new Date(dateOfBirth)),
             phone, address, city, state, country,
             departmentId, position,
-            hireDate: new Date(hireDate),
+            hireDate: toTimestampString(new Date(hireDate)),
             salary,
-          },
         });
 
         if (role === Role.DOCTOR) {
-          if (!licenseNumber) throw new Error('License number required for doctors');
-          await tx.doctor.create({
-            data: {
-              staffId: staff.id,
+          if (!licenseNumber) throw new ConflictError('License number required for doctors');
+          await tx.orm.public.Doctor.create({
+              staffId: createdStaff.id,
               licenseNumber, specializationId,
               qualification: qualification || 'MBBS',
               experience: experience || 0,
               consultationFee: consultationFee || 0,
               bio,
-            },
           });
         }
 
         if (role === Role.NURSE) {
-          if (!licenseNumber) throw new Error('License number required for nurses');
-          await tx.nurse.create({
-            data: {
-              staffId: staff.id,
+          if (!licenseNumber) throw new ConflictError('License number required for nurses');
+          await tx.orm.public.Nurse.create({
+              staffId: createdStaff.id,
               licenseNumber, nurseType, wardId,
-            },
           });
         }
 
-        return staff;
+        return createdStaff;
       });
 
-      const created = await prisma.staff.findUnique({
-        where: { id: staff.id },
-        include: {
-          user: { select: { email: true, role: true } },
-          department: true,
-          doctor: { include: { specialization: true } },
-          nurse: true,
-        },
-      });
+      const created = await db.orm.public.Staff
+        .include('user', (user) => user.select('email', 'role'))
+        .include('department')
+        .include('doctor', (doctor) => doctor.include('specialization'))
+        .include('nurse')
+        .where({ id: staff.id })
+        .first();
 
       await logAudit(req.user?.userId, 'CREATE', 'staff', staff.id, null, created, req.ip);
       return sendCreated(res, created, 'Staff member created successfully');
@@ -104,38 +102,37 @@ export class StaffController {
       );
       const { search, departmentId, role, isOnDuty } = req.query;
 
-      const where: Record<string, unknown> = {};
-      if (search) {
-        where.OR = [
-          { firstName: { contains: search as string, mode: 'insensitive' } },
-          { lastName: { contains: search as string, mode: 'insensitive' } },
-          { staffId: { contains: search as string, mode: 'insensitive' } },
-          { phone: { contains: search as string } },
-        ];
-      }
-      if (departmentId) where.departmentId = departmentId;
-      if (isOnDuty) where.isOnDuty = isOnDuty === 'true';
-      if (role) {
-        where.user = { role };
-      }
+      const pattern = search ? `%${String(search).replace(/[\\%_]/g, '\\$&')}%` : undefined;
+      const query = db.orm.public.Staff.where((staff) =>
+        and(
+          pattern
+            ? or(
+                staff.firstName.ilike(pattern),
+                staff.lastName.ilike(pattern),
+                staff.staffId.ilike(pattern),
+                staff.phone.ilike(pattern)
+              )
+            : all(),
+          departmentId ? staff.departmentId.eq(departmentId as string) : all(),
+          isOnDuty ? staff.isOnDuty.eq(isOnDuty === 'true') : all(),
+          role ? staff.user.some({ role: role as Role }) : all()
+        )
+      );
 
       const [total, staff] = await Promise.all([
-        prisma.staff.count({ where }),
-        prisma.staff.findMany({
-          where,
-          skip,
-          take: limit,
-          orderBy: { createdAt: 'desc' },
-          include: {
-            user: { select: { email: true, role: true, isActive: true } },
-            department: { select: { name: true, code: true } },
-            doctor: { include: { specialization: true } },
-            nurse: { select: { id: true, licenseNumber: true, nurseType: true } },
-          },
-        }),
+        query.aggregate((aggregate) => ({ total: aggregate.count() })),
+        query
+          .include('user', (user) => user.select('email', 'role', 'isActive'))
+          .include('department', (department) => department.select('name', 'code'))
+          .include('doctor', (doctor) => doctor.include('specialization'))
+          .include('nurse', (nurse) => nurse.select('id', 'licenseNumber', 'nurseType'))
+          .orderBy((staff) => staff.createdAt.desc())
+          .offset(skip)
+          .limit(limit)
+          .all(),
       ]);
 
-      return sendSuccess(res, staff, 'Staff retrieved', 200, buildPaginationMeta(total, page, limit));
+      return sendSuccess(res, staff, 'Staff retrieved', 200, buildPaginationMeta(total.total, page, limit));
     } catch (error) {
       next(error);
     }
@@ -147,16 +144,14 @@ export class StaffController {
   static async findOne(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      const staff = await prisma.staff.findFirst({
-        where: { OR: [{ id }, { staffId: id }] },
-        include: {
-          user: { select: { email: true, role: true, isActive: true, lastLoginAt: true } },
-          department: true,
-          doctor: { include: { specialization: true } },
-          nurse: { include: { ward: true } },
-          shifts: { orderBy: { startTime: 'desc' }, take: 10 },
-        },
-      });
+      const staff = await db.orm.public.Staff
+        .include('user', (user) => user.select('email', 'role', 'isActive', 'lastLoginAt'))
+        .include('department')
+        .include('doctor', (doctor) => doctor.include('specialization'))
+        .include('nurse', (nurse) => nurse.include('ward'))
+        .include('shifts', (shifts) => shifts.orderBy((shift) => shift.startTime.desc()).limit(10))
+        .where((record) => or(record.id.eq(id), record.staffId.eq(id)))
+        .first();
 
       if (!staff) throw new NotFoundError('Staff member not found');
       return sendSuccess(res, staff);
@@ -171,9 +166,7 @@ export class StaffController {
   static async update(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      const existing = await prisma.staff.findFirst({
-        where: { OR: [{ id }, { staffId: id }] },
-      });
+      const existing = await findStaff(id);
       if (!existing) throw new NotFoundError('Staff not found');
 
       const {
@@ -182,20 +175,18 @@ export class StaffController {
         position, salary, isOnDuty,
       } = req.body;
 
-      const staff = await prisma.staff.update({
-        where: { id: existing.id },
-        data: {
+      const staff = await db.orm.public.Staff
+        .include('user', (user) => user.select('email', 'role'))
+        .include('department')
+        .include('doctor')
+        .include('nurse')
+        .where({ id: existing.id })
+        .update({
           firstName, lastName, middleName, gender,
-          dateOfBirth: dateOfBirth ? new Date(dateOfBirth) : undefined,
+          dateOfBirth: dateOfBirth ? toTimestampString(new Date(dateOfBirth)) : undefined,
           phone, address, city, state, country, departmentId, position, salary, isOnDuty,
-        },
-        include: {
-          user: { select: { email: true, role: true } },
-          department: true,
-          doctor: true,
-          nurse: true,
-        },
       });
+      if (!staff) throw new NotFoundError('Staff member not found');
 
       await logAudit(req.user?.userId, 'UPDATE', 'staff', staff.id, existing, staff);
       return sendSuccess(res, staff, 'Staff updated successfully');
@@ -211,24 +202,21 @@ export class StaffController {
     try {
       const { specializationId, departmentId, isAvailable } = req.query;
 
-      const where: Record<string, unknown> = {};
-      if (specializationId) where.specializationId = specializationId;
-      if (isAvailable !== undefined) where.isAvailable = isAvailable === 'true';
-      if (departmentId) where.staff = { departmentId };
-
-      const doctors = await prisma.doctor.findMany({
-        where,
-        include: {
-          staff: {
-            select: {
-              firstName: true, lastName: true, phone: true,
-              profilePhoto: true, isOnDuty: true, departmentId: true,
-              department: { select: { name: true } },
-            },
-          },
-          specialization: true,
-        },
-      });
+      const doctors = await db.orm.public.Doctor
+        .include('staff', (staff) =>
+          staff
+            .select('firstName', 'lastName', 'phone', 'profilePhoto', 'isOnDuty', 'departmentId')
+            .include('department', (department) => department.select('name'))
+        )
+        .include('specialization')
+        .where((doctor) =>
+          and(
+            specializationId ? doctor.specializationId.eq(specializationId as string) : all(),
+            isAvailable !== undefined ? doctor.isAvailable.eq(isAvailable === 'true') : all(),
+            departmentId ? doctor.staff.some({ departmentId: departmentId as string }) : all()
+          )
+        )
+        .all();
 
       return sendSuccess(res, doctors, 'Doctors retrieved');
     } catch (error) {
@@ -242,20 +230,16 @@ export class StaffController {
   static async createShift(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      const staff = await prisma.staff.findFirst({
-        where: { OR: [{ id }, { staffId: id }] },
-      });
+      const staff = await findStaff(id);
       if (!staff) throw new NotFoundError('Staff not found');
 
       const { shiftType, startTime, endTime, notes } = req.body;
-      const shift = await prisma.shift.create({
-        data: {
+      const shift = await db.orm.public.Shift.create({
           staffId: staff.id,
           shiftType,
-          startTime: new Date(startTime),
-          endTime: new Date(endTime),
+          startTime: toTimestampString(new Date(startTime)),
+          endTime: toTimestampString(new Date(endTime)),
           notes,
-        },
       });
 
       return sendCreated(res, shift, 'Shift scheduled');
@@ -270,15 +254,12 @@ export class StaffController {
   static async getShifts(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      const staff = await prisma.staff.findFirst({
-        where: { OR: [{ id }, { staffId: id }] },
-      });
+      const staff = await findStaff(id);
       if (!staff) throw new NotFoundError('Staff not found');
 
-      const shifts = await prisma.shift.findMany({
-        where: { staffId: staff.id },
-        orderBy: { startTime: 'desc' },
-      });
+      const shifts = await db.orm.public.Shift.where({ staffId: staff.id })
+        .orderBy((shift) => shift.startTime.desc())
+        .all();
 
       return sendSuccess(res, shifts, 'Shifts retrieved');
     } catch (error) {
@@ -292,16 +273,12 @@ export class StaffController {
   static async deactivate(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      const staff = await prisma.staff.findFirst({
-        where: { OR: [{ id }, { staffId: id }] },
-        include: { user: true },
-      });
+      const staff = await db.orm.public.Staff.include('user').where((record) =>
+        or(record.id.eq(id), record.staffId.eq(id))
+      ).first();
       if (!staff) throw new NotFoundError('Staff not found');
 
-      await prisma.user.update({
-        where: { id: staff.userId },
-        data: { isActive: false },
-      });
+      await db.orm.public.User.where({ id: staff.userId }).update({ isActive: false });
 
       await logAudit(req.user?.userId, 'DEACTIVATE', 'staff', staff.id);
       return sendSuccess(res, null, 'Staff account deactivated');
