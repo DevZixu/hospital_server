@@ -1,9 +1,20 @@
 import { Request, Response, NextFunction } from 'express';
-import { prisma } from '../config/database';
+import { db } from '../config/database';
+import { all, and, or } from '@prisma/orm-postgres/orm-client';
+import type { TimestampString } from '@prisma/orm-postgres/target/codec-types';
+import { BloodGroup, Gender } from '@prisma/client';
 import { NotFoundError } from '../utils/errors';
 import { sendSuccess, sendCreated, getPaginationParams, buildPaginationMeta } from '../utils/response';
 import { generatePatientId } from '../utils/helpers';
 import { logAudit } from '../middleware/audit.middleware';
+
+const toTimestampString = (value: Date): TimestampString<3> =>
+  value.toISOString() as TimestampString<3>;
+
+const findPatient = (id: string) =>
+  db.orm.public.Patient.where((patient) =>
+    or(patient.id.eq(id), patient.patientId.eq(id))
+  ).first();
 
 export class PatientController {
   /**
@@ -20,20 +31,17 @@ export class PatientController {
 
       const patientId = generatePatientId();
 
-      const patient = await prisma.patient.create({
-        data: {
+      const patient = await db.orm.public.Patient.create({
           patientId,
           firstName, lastName, middleName, gender,
-          dateOfBirth: new Date(dateOfBirth),
+          dateOfBirth: toTimestampString(new Date(dateOfBirth)),
           phone, email, address, city, state, country,
           bloodGroup, genotype, maritalStatus, occupation, nationality,
           nextOfKinName, nextOfKinPhone, nextOfKinRelation,
           allergies: allergies || [],
           chronicConditions: chronicConditions || [],
           userId,
-        },
-        include: { emergencyContacts: true, insurances: true },
-      });
+        });
 
       await logAudit(req.user?.userId, 'CREATE', 'patient', patient.id, null, patient, req.ip);
       return sendCreated(res, patient, 'Patient registered successfully');
@@ -53,34 +61,39 @@ export class PatientController {
       );
       const { search, bloodGroup, gender } = req.query;
 
-      const where: Record<string, unknown> = {};
-      if (search) {
-        where.OR = [
-          { firstName: { contains: search as string, mode: 'insensitive' } },
-          { lastName: { contains: search as string, mode: 'insensitive' } },
-          { patientId: { contains: search as string, mode: 'insensitive' } },
-          { phone: { contains: search as string } },
-          { email: { contains: search as string, mode: 'insensitive' } },
-        ];
-      }
-      if (bloodGroup) where.bloodGroup = bloodGroup;
-      if (gender) where.gender = gender;
+      const pattern = search
+        ? `%${String(search).replace(/[\\%_]/g, '\\$&')}%`
+        : undefined;
+      const query = db.orm.public.Patient.where((patient) =>
+        and(
+          pattern
+            ? or(
+                patient.firstName.ilike(pattern),
+                patient.lastName.ilike(pattern),
+                patient.patientId.ilike(pattern),
+                patient.phone.ilike(pattern),
+                patient.email.ilike(pattern)
+              )
+            : all(),
+          bloodGroup ? patient.bloodGroup.eq(bloodGroup as BloodGroup) : all(),
+          gender ? patient.gender.eq(gender as Gender) : all()
+        )
+      );
 
-      const [total, patients] = await Promise.all([
-        prisma.patient.count({ where }),
-        prisma.patient.findMany({
-          where,
-          skip,
-          take: limit,
-          orderBy: { createdAt: 'desc' },
-          select: {
-            id: true, patientId: true, firstName: true, lastName: true,
-            gender: true, dateOfBirth: true, phone: true, email: true,
-            bloodGroup: true, maritalStatus: true, profilePhoto: true,
-            createdAt: true, isDeceased: true,
-          },
-        }),
+      const [count, patients] = await Promise.all([
+        query.aggregate((aggregate) => ({ total: aggregate.count() })),
+        query
+          .select(
+            'id', 'patientId', 'firstName', 'lastName', 'gender', 'dateOfBirth',
+            'phone', 'email', 'bloodGroup', 'maritalStatus', 'profilePhoto',
+            'createdAt', 'isDeceased'
+          )
+          .orderBy((patient) => patient.createdAt.desc())
+          .offset(skip)
+          .limit(limit)
+          .all(),
       ]);
+      const total = count.total;
 
       return sendSuccess(res, patients, 'Patients retrieved', 200, buildPaginationMeta(total, page, limit));
     } catch (error) {
@@ -94,14 +107,12 @@ export class PatientController {
   static async findOne(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      const patient = await prisma.patient.findFirst({
-        where: { OR: [{ id }, { patientId: id }] },
-        include: {
-          emergencyContacts: true,
-          insurances: true,
-          user: { select: { email: true, role: true, isEmailVerified: true } },
-        },
-      });
+      const patient = await db.orm.public.Patient
+        .include('emergencyContacts')
+        .include('insurances')
+        .include('user', (user) => user.select('email', 'role', 'isEmailVerified'))
+        .where((record) => or(record.id.eq(id), record.patientId.eq(id)))
+        .first();
 
       if (!patient) throw new NotFoundError('Patient not found');
       return sendSuccess(res, patient);
@@ -116,9 +127,7 @@ export class PatientController {
   static async update(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      const existing = await prisma.patient.findFirst({
-        where: { OR: [{ id }, { patientId: id }] },
-      });
+      const existing = await findPatient(id);
       if (!existing) throw new NotFoundError('Patient not found');
 
       const {
@@ -128,17 +137,15 @@ export class PatientController {
         allergies, chronicConditions,
       } = req.body;
 
-      const patient = await prisma.patient.update({
-        where: { id: existing.id },
-        data: {
+      const patient = await db.orm.public.Patient.where({ id: existing.id }).update({
           firstName, lastName, middleName, gender,
-          dateOfBirth: dateOfBirth ? new Date(dateOfBirth) : undefined,
+          dateOfBirth: dateOfBirth ? toTimestampString(new Date(dateOfBirth)) : undefined,
           phone, email, address, city, state, country,
           bloodGroup, genotype, maritalStatus, occupation, nationality,
           nextOfKinName, nextOfKinPhone, nextOfKinRelation,
           allergies, chronicConditions,
-        },
       });
+      if (!patient) throw new NotFoundError('Patient not found');
 
       await logAudit(req.user?.userId, 'UPDATE', 'patient', patient.id, existing, patient);
       return sendSuccess(res, patient, 'Patient updated successfully');
@@ -153,27 +160,28 @@ export class PatientController {
   static async getMedicalHistory(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      const patient = await prisma.patient.findFirst({
-        where: { OR: [{ id }, { patientId: id }] },
-      });
+      const patient = await findPatient(id);
       if (!patient) throw new NotFoundError('Patient not found');
 
-      const history = await prisma.medicalRecord.findMany({
-        where: { patientId: patient.id },
-        orderBy: { visitDate: 'desc' },
-        include: {
-          doctor: {
-            include: {
-              staff: { select: { firstName: true, lastName: true } },
-              specialization: true,
-            },
-          },
-          diagnoses: true,
-          vitalSigns: { orderBy: { recordedAt: 'desc' }, take: 1 },
-          prescriptions: { include: { items: { include: { medication: true } } } },
-          labOrders: { include: { items: { include: { labTest: true } } } },
-        },
-      });
+      const history = await db.orm.public.MedicalRecord
+        .include('doctor', (doctor) =>
+          doctor
+            .include('staff', (staff) => staff.select('firstName', 'lastName'))
+            .include('specialization')
+        )
+        .include('diagnoses')
+        .include('vitalSigns', (vitals) =>
+          vitals.orderBy((vital) => vital.recordedAt.desc()).limit(1)
+        )
+        .include('prescriptions', (prescriptions) =>
+          prescriptions.include('items', (items) => items.include('medication'))
+        )
+        .include('labOrders', (orders) =>
+          orders.include('items', (items) => items.include('labTest'))
+        )
+        .where({ patientId: patient.id })
+        .orderBy((record) => record.visitDate.desc())
+        .all();
 
       return sendSuccess(res, history, 'Medical history retrieved');
     } catch (error) {
@@ -191,25 +199,23 @@ export class PatientController {
         req.query.page as string, req.query.limit as string
       );
 
-      const patient = await prisma.patient.findFirst({
-        where: { OR: [{ id }, { patientId: id }] },
-      });
+      const patient = await findPatient(id);
       if (!patient) throw new NotFoundError('Patient not found');
 
       const [total, vitals] = await Promise.all([
-        prisma.vitalSign.count({ where: { patientId: patient.id } }),
-        prisma.vitalSign.findMany({
-          where: { patientId: patient.id },
-          orderBy: { recordedAt: 'desc' },
-          skip,
-          take: limit,
-          include: {
-            nurse: { include: { staff: { select: { firstName: true, lastName: true } } } },
-          },
-        }),
+        db.orm.public.VitalSign
+          .where({ patientId: patient.id })
+          .aggregate((aggregate) => ({ total: aggregate.count() })),
+        db.orm.public.VitalSign
+          .include('nurse', (nurse) => nurse.include('staff', (staff) => staff.select('firstName', 'lastName')))
+          .where({ patientId: patient.id })
+          .orderBy((vital) => vital.recordedAt.desc())
+          .offset(skip)
+          .limit(limit)
+          .all(),
       ]);
 
-      return sendSuccess(res, vitals, 'Vitals retrieved', 200, buildPaginationMeta(total, page, limit));
+      return sendSuccess(res, vitals, 'Vitals retrieved', 200, buildPaginationMeta(total.total, page, limit));
     } catch (error) {
       next(error);
     }
@@ -221,18 +227,14 @@ export class PatientController {
   static async getAdmissions(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      const patient = await prisma.patient.findFirst({
-        where: { OR: [{ id }, { patientId: id }] },
-      });
+      const patient = await findPatient(id);
       if (!patient) throw new NotFoundError('Patient not found');
 
-      const admissions = await prisma.admission.findMany({
-        where: { patientId: patient.id },
-        orderBy: { admissionDate: 'desc' },
-        include: {
-          bed: { include: { ward: true } },
-        },
-      });
+      const admissions = await db.orm.public.Admission
+        .include('bed', (bed) => bed.include('ward'))
+        .where({ patientId: patient.id })
+        .orderBy((admission) => admission.admissionDate.desc())
+        .all();
 
       return sendSuccess(res, admissions, 'Admissions retrieved');
     } catch (error) {
@@ -246,20 +248,16 @@ export class PatientController {
   static async getBills(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      const patient = await prisma.patient.findFirst({
-        where: { OR: [{ id }, { patientId: id }] },
-      });
+      const patient = await findPatient(id);
       if (!patient) throw new NotFoundError('Patient not found');
 
-      const bills = await prisma.bill.findMany({
-        where: { patientId: patient.id },
-        orderBy: { createdAt: 'desc' },
-        include: {
-          items: true,
-          payments: true,
-          insurances: { include: { insurance: true } },
-        },
-      });
+      const bills = await db.orm.public.Bill
+        .include('items')
+        .include('payments')
+        .include('insurances', (claims) => claims.include('insurance'))
+        .where({ patientId: patient.id })
+        .orderBy((bill) => bill.createdAt.desc())
+        .all();
 
       return sendSuccess(res, bills, 'Bills retrieved');
     } catch (error) {
@@ -273,14 +271,10 @@ export class PatientController {
   static async addEmergencyContact(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      const patient = await prisma.patient.findFirst({
-        where: { OR: [{ id }, { patientId: id }] },
-      });
+      const patient = await findPatient(id);
       if (!patient) throw new NotFoundError('Patient not found');
 
-      const contact = await prisma.emergencyContact.create({
-        data: { ...req.body, patientId: patient.id },
-      });
+      const contact = await db.orm.public.EmergencyContact.create({ ...req.body, patientId: patient.id });
 
       return sendCreated(res, contact, 'Emergency contact added');
     } catch (error) {
@@ -294,21 +288,17 @@ export class PatientController {
   static async addInsurance(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      const patient = await prisma.patient.findFirst({
-        where: { OR: [{ id }, { patientId: id }] },
-      });
+      const patient = await findPatient(id);
       if (!patient) throw new NotFoundError('Patient not found');
 
       const { startDate, endDate, memberDob, verificationDate, ...rest } = req.body;
-      const insurance = await prisma.insurance.create({
-        data: {
+      const insurance = await db.orm.public.Insurance.create({
           ...rest,
           patientId: patient.id,
-          startDate: new Date(startDate),
-          endDate: endDate ? new Date(endDate) : undefined,
-          memberDob: memberDob ? new Date(memberDob) : undefined,
-          verificationDate: verificationDate ? new Date(verificationDate) : undefined,
-        },
+          startDate: toTimestampString(new Date(startDate)),
+          endDate: endDate ? toTimestampString(new Date(endDate)) : undefined,
+          memberDob: memberDob ? toTimestampString(new Date(memberDob)) : undefined,
+          verificationDate: verificationDate ? toTimestampString(new Date(verificationDate)) : undefined,
       });
 
       return sendCreated(res, insurance, 'Insurance added');
@@ -323,14 +313,12 @@ export class PatientController {
   static async deactivate(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      const patient = await prisma.patient.findFirst({
-        where: { OR: [{ id }, { patientId: id }] },
-      });
+      const patient = await findPatient(id);
       if (!patient) throw new NotFoundError('Patient not found');
 
-      await prisma.patient.update({
-        where: { id: patient.id },
-        data: { isDeceased: true, deceasedAt: new Date() },
+      await db.orm.public.Patient.where({ id: patient.id }).update({
+        isDeceased: true,
+        deceasedAt: toTimestampString(new Date()),
       });
 
       await logAudit(req.user?.userId, 'MARK_DECEASED', 'patient', patient.id);
