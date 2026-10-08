@@ -1,9 +1,17 @@
 import { Request, Response, NextFunction } from 'express';
-import { prisma } from '../config/database';
+import { db } from '../config/database';
+import { all, and, or } from '@prisma/orm-postgres/orm-client';
+import type { TimestampString } from '@prisma/orm-postgres/target/codec-types';
 import { NotFoundError } from '../utils/errors';
 import { sendSuccess, sendCreated, getPaginationParams, buildPaginationMeta } from '../utils/response';
 import { generateRecordNo } from '../utils/helpers';
 import { logAudit } from '../middleware/audit.middleware';
+
+const toTimestampString = (value: Date): TimestampString<3> =>
+  value.toISOString() as TimestampString<3>;
+
+const findRecord = (id: string) =>
+  db.orm.public.MedicalRecord.where((record) => or(record.id.eq(id), record.recordNo.eq(id))).first();
 
 export class MedicalRecordController {
   /**
@@ -20,15 +28,18 @@ export class MedicalRecordController {
       } = req.body;
 
       const [patient, doctor] = await Promise.all([
-        prisma.patient.findFirst({ where: { OR: [{ id: patientId }, { patientId }] } }),
-        prisma.doctor.findFirst({ where: { OR: [{ id: doctorId }, { staff: { staffId: doctorId } }] } }),
+        db.orm.public.Patient.where((patient) =>
+          or(patient.id.eq(patientId), patient.patientId.eq(patientId))
+        ).first(),
+        db.orm.public.Doctor.where((doctor) =>
+          or(doctor.id.eq(doctorId), doctor.staff.some({ staffId: doctorId }))
+        ).first(),
       ]);
 
       if (!patient) throw new NotFoundError('Patient not found');
       if (!doctor) throw new NotFoundError('Doctor not found');
 
-      const record = await prisma.medicalRecord.create({
-        data: {
+      const created = await db.orm.public.MedicalRecord.create({
           recordNo: generateRecordNo(),
           patientId: patient.id,
           doctorId: doctor.id,
@@ -43,26 +54,25 @@ export class MedicalRecordController {
           physicalExamination,
           assessment,
           plan,
-          followUpDate: followUpDate ? new Date(followUpDate) : undefined,
+          followUpDate: followUpDate ? toTimestampString(new Date(followUpDate)) : undefined,
           followUpNotes,
           isConfidential: isConfidential || false,
           diagnoses: diagnoses
-            ? {
-                create: diagnoses.map((d: { name: string; icdCode?: string; description?: string; isPrimary?: boolean }) => ({
+            ? (items) => items.create(diagnoses.map((d: { name: string; icdCode?: string; description?: string; isPrimary?: boolean }) => ({
                   name: d.name,
                   icdCode: d.icdCode,
                   description: d.description,
                   isPrimary: d.isPrimary || false,
-                })),
-              }
+                })))
             : undefined,
-        },
-        include: {
-          patient: { select: { firstName: true, lastName: true, patientId: true } },
-          doctor: { include: { staff: { select: { firstName: true, lastName: true } } } },
-          diagnoses: true,
-        },
       });
+      const record = await db.orm.public.MedicalRecord
+        .include('patient', (record) => record.select('firstName', 'lastName', 'patientId'))
+        .include('doctor', (doctor) => doctor.include('staff', (staff) => staff.select('firstName', 'lastName')))
+        .include('diagnoses')
+        .where({ id: created.id })
+        .first();
+      if (!record) throw new NotFoundError('Medical record could not be created');
 
       await logAudit(req.user?.userId, 'CREATE', 'medical_record', record.id, null, record);
       return sendCreated(res, record, 'Medical record created');
@@ -81,26 +91,26 @@ export class MedicalRecordController {
       );
       const { patientId, doctorId } = req.query;
 
-      const where: Record<string, unknown> = {};
-      if (patientId) where.patientId = patientId;
-      if (doctorId) where.doctorId = doctorId;
+      const query = db.orm.public.MedicalRecord.where((record) =>
+        and(
+          patientId ? record.patientId.eq(patientId as string) : all(),
+          doctorId ? record.doctorId.eq(doctorId as string) : all()
+        )
+      );
 
       const [total, records] = await Promise.all([
-        prisma.medicalRecord.count({ where }),
-        prisma.medicalRecord.findMany({
-          where,
-          skip,
-          take: limit,
-          orderBy: { visitDate: 'desc' },
-          include: {
-            patient: { select: { firstName: true, lastName: true, patientId: true } },
-            doctor: { include: { staff: { select: { firstName: true, lastName: true } } } },
-            diagnoses: true,
-          },
-        }),
+        query.aggregate((aggregate) => ({ total: aggregate.count() })),
+        query
+          .include('patient', (patient) => patient.select('firstName', 'lastName', 'patientId'))
+          .include('doctor', (doctor) => doctor.include('staff', (staff) => staff.select('firstName', 'lastName')))
+          .include('diagnoses')
+          .orderBy((record) => record.visitDate.desc())
+          .offset(skip)
+          .limit(limit)
+          .all(),
       ]);
 
-      return sendSuccess(res, records, 'Medical records retrieved', 200, buildPaginationMeta(total, page, limit));
+      return sendSuccess(res, records, 'Medical records retrieved', 200, buildPaginationMeta(total.total, page, limit));
     } catch (error) {
       next(error);
     }
@@ -112,31 +122,26 @@ export class MedicalRecordController {
   static async findOne(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      const record = await prisma.medicalRecord.findFirst({
-        where: { OR: [{ id }, { recordNo: id }] },
-        include: {
-          patient: true,
-          doctor: {
-            include: {
-              staff: { select: { firstName: true, lastName: true, profilePhoto: true } },
-              specialization: true,
-            },
-          },
-          diagnoses: true,
-          vitalSigns: { orderBy: { recordedAt: 'desc' } },
-          prescriptions: {
-            include: { items: { include: { medication: true } } },
-          },
-          labOrders: {
-            include: { items: { include: { labTest: true } } },
-          },
-          radiologyOrders: true,
-          nurseNotes: {
-            include: { nurse: { include: { staff: { select: { firstName: true, lastName: true } } } } },
-          },
-          appointment: { select: { appointmentNo: true, type: true, scheduledAt: true } },
-        },
-      });
+      const record = await db.orm.public.MedicalRecord
+        .include('patient')
+        .include('doctor', (doctor) =>
+          doctor
+            .include('staff', (staff) => staff.select('firstName', 'lastName', 'profilePhoto'))
+            .include('specialization')
+        )
+        .include('diagnoses')
+        .include('vitalSigns', (vitals) => vitals.orderBy((vital) => vital.recordedAt.desc()))
+        .include('prescriptions', (prescriptions) =>
+          prescriptions.include('items', (items) => items.include('medication'))
+        )
+        .include('labOrders', (orders) => orders.include('items', (items) => items.include('labTest')))
+        .include('radiologyOrders')
+        .include('nurseNotes', (notes) =>
+          notes.include('nurse', (nurse) => nurse.include('staff', (staff) => staff.select('firstName', 'lastName')))
+        )
+        .include('appointment', (appointment) => appointment.select('appointmentNo', 'type', 'scheduledAt'))
+        .where((item) => or(item.id.eq(id), item.recordNo.eq(id)))
+        .first();
 
       if (!record) throw new NotFoundError('Medical record not found');
       return sendSuccess(res, record);
@@ -151,9 +156,7 @@ export class MedicalRecordController {
   static async update(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      const existing = await prisma.medicalRecord.findFirst({
-        where: { OR: [{ id }, { recordNo: id }] },
-      });
+      const existing = await findRecord(id);
       if (!existing) throw new NotFoundError('Medical record not found');
 
       const {
@@ -162,17 +165,17 @@ export class MedicalRecordController {
         assessment, plan, followUpDate, followUpNotes,
       } = req.body;
 
-      const record = await prisma.medicalRecord.update({
-        where: { id: existing.id },
-        data: {
+      const record = await db.orm.public.MedicalRecord
+        .include('diagnoses')
+        .where({ id: existing.id })
+        .update({
           chiefComplaint, historyOfPresentIllness, pastMedicalHistory,
           familyHistory, socialHistory, reviewOfSystems, physicalExamination,
           assessment, plan,
-          followUpDate: followUpDate ? new Date(followUpDate) : undefined,
+          followUpDate: followUpDate ? toTimestampString(new Date(followUpDate)) : undefined,
           followUpNotes,
-        },
-        include: { diagnoses: true },
       });
+      if (!record) throw new NotFoundError('Medical record not found');
 
       await logAudit(req.user?.userId, 'UPDATE', 'medical_record', record.id);
       return sendSuccess(res, record, 'Medical record updated');
@@ -187,18 +190,14 @@ export class MedicalRecordController {
   static async addDiagnosis(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      const record = await prisma.medicalRecord.findFirst({
-        where: { OR: [{ id }, { recordNo: id }] },
-      });
+      const record = await findRecord(id);
       if (!record) throw new NotFoundError('Medical record not found');
 
       const { name, icdCode, description, isPrimary } = req.body;
-      const diagnosis = await prisma.diagnosis.create({
-        data: {
+      const diagnosis = await db.orm.public.Diagnosis.create({
           medicalRecordId: record.id,
           name, icdCode, description,
           isPrimary: isPrimary || false,
-        },
       });
 
       return sendCreated(res, diagnosis, 'Diagnosis added');
@@ -213,17 +212,13 @@ export class MedicalRecordController {
   static async addVitals(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      const record = await prisma.medicalRecord.findFirst({
-        where: { OR: [{ id }, { recordNo: id }] },
-      });
+      const record = await findRecord(id);
       if (!record) throw new NotFoundError('Medical record not found');
 
       // Get nurse ID if the user is a nurse
       let nurseId: string | undefined;
       if (req.user?.role === 'NURSE') {
-        const nurse = await prisma.nurse.findFirst({
-          where: { staff: { userId: req.user.userId } },
-        });
+        const nurse = await db.orm.public.Nurse.where((item) => item.staff.some({ userId: req.user!.userId })).first();
         nurseId = nurse?.id;
       }
 
@@ -241,8 +236,7 @@ export class MedicalRecordController {
         calculatedBMI = parseFloat((weight / (heightM * heightM)).toFixed(1));
       }
 
-      const vital = await prisma.vitalSign.create({
-        data: {
+      const vital = await db.orm.public.VitalSign.create({
           patientId: record.patientId,
           medicalRecordId: record.id,
           nurseId,
@@ -250,7 +244,6 @@ export class MedicalRecordController {
           temperature, temperatureUnit, respiratoryRate, oxygenSaturation,
           weight, weightUnit, height, heightUnit, bmi: calculatedBMI,
           bloodGlucose, bloodGlucoseUnit, painScale, notes,
-        },
       });
 
       return sendCreated(res, vital, 'Vitals recorded');
@@ -265,28 +258,22 @@ export class MedicalRecordController {
   static async addNurseNote(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      const record = await prisma.medicalRecord.findFirst({
-        where: { OR: [{ id }, { recordNo: id }] },
-      });
+      const record = await findRecord(id);
       if (!record) throw new NotFoundError('Medical record not found');
 
       let nurseId: string | undefined;
       if (req.user?.role === 'NURSE') {
-        const nurse = await prisma.nurse.findFirst({
-          where: { staff: { userId: req.user.userId } },
-        });
+        const nurse = await db.orm.public.Nurse.where((item) => item.staff.some({ userId: req.user!.userId })).first();
         nurseId = nurse?.id;
       }
 
       const { note, noteType } = req.body;
-      const nurseNote = await prisma.nurseNote.create({
-        data: {
+      const nurseNote = await db.orm.public.NurseNote.create({
           medicalRecordId: record.id,
           patientId: record.patientId,
           nurseId,
           note,
           noteType: noteType || 'GENERAL',
-        },
       });
 
       return sendCreated(res, nurseNote, 'Nurse note added');
