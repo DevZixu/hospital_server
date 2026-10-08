@@ -1,10 +1,20 @@
 import { Request, Response, NextFunction } from 'express';
-import { prisma } from '../config/database';
+import { db } from '../config/database';
+import { all, and, or } from '@prisma/orm-postgres/orm-client';
+import type { TimestampString } from '@prisma/orm-postgres/target/codec-types';
 import { NotFoundError, AppError } from '../utils/errors';
 import { sendSuccess, sendCreated, getPaginationParams, buildPaginationMeta } from '../utils/response';
 import { generateAppointmentNo } from '../utils/helpers';
 import { logAudit } from '../middleware/audit.middleware';
-import { AppointmentStatus } from '@prisma/client';
+import { AppointmentStatus, AppointmentType } from '@prisma/client';
+
+const toTimestampString = (value: Date): TimestampString<3> =>
+  value.toISOString() as TimestampString<3>;
+
+const findAppointment = (id: string) =>
+  db.orm.public.Appointment.where((appointment) =>
+    or(appointment.id.eq(id), appointment.appointmentNo.eq(id))
+  ).first();
 
 export class AppointmentController {
   /**
@@ -19,8 +29,12 @@ export class AppointmentController {
 
       // Validate patient and doctor exist
       const [patient, doctor] = await Promise.all([
-        prisma.patient.findFirst({ where: { OR: [{ id: patientId }, { patientId }] } }),
-        prisma.doctor.findFirst({ where: { OR: [{ id: doctorId }, { staff: { staffId: doctorId } }] } }),
+        db.orm.public.Patient.where((patient) =>
+          or(patient.id.eq(patientId), patient.patientId.eq(patientId))
+        ).first(),
+        db.orm.public.Doctor.where((doctor) =>
+          or(doctor.id.eq(doctorId), doctor.staff.some({ staffId: doctorId }))
+        ).first(),
       ]);
 
       if (!patient) throw new NotFoundError('Patient not found');
@@ -30,46 +44,35 @@ export class AppointmentController {
       const scheduledDate = new Date(scheduledAt);
       const endTime = new Date(scheduledDate.getTime() + (duration || 30) * 60000);
 
-      const conflict = await prisma.appointment.findFirst({
-        where: {
-          doctorId: doctor.id,
-          status: { notIn: [AppointmentStatus.CANCELLED, AppointmentStatus.NO_SHOW] },
-          scheduledAt: { lt: endTime },
-          AND: {
-            scheduledAt: { gte: new Date(scheduledDate.getTime() - 30 * 60000) },
-          },
-        },
-      });
+      const conflict = await db.orm.public.Appointment.where((appointment) =>
+        and(
+          appointment.doctorId.eq(doctor.id),
+          appointment.status.neq(AppointmentStatus.CANCELLED),
+          appointment.status.neq(AppointmentStatus.NO_SHOW),
+          appointment.scheduledAt.lt(toTimestampString(endTime)),
+          appointment.scheduledAt.gte(
+            toTimestampString(new Date(scheduledDate.getTime() - 30 * 60000))
+          )
+        )
+      ).first();
 
       if (conflict) {
         throw new AppError('Doctor has a conflicting appointment at this time', 409);
       }
 
-      const appointment = await prisma.appointment.create({
-        data: {
+      const appointment = await db.orm.public.Appointment.create({
           appointmentNo: generateAppointmentNo(),
           patientId: patient.id,
           doctorId: doctor.id,
           departmentId,
           type,
-          scheduledAt: scheduledDate,
+          scheduledAt: toTimestampString(scheduledDate),
           duration: duration || 30,
           chiefComplaint,
           notes,
           isFollowUp: isFollowUp || false,
           parentAppointmentId,
-        },
-        include: {
-          patient: { select: { firstName: true, lastName: true, patientId: true, phone: true } },
-          doctor: {
-            include: {
-              staff: { select: { firstName: true, lastName: true } },
-              specialization: true,
-            },
-          },
-          department: true,
-        },
-      });
+        });
 
       await logAudit(req.user?.userId, 'CREATE', 'appointment', appointment.id, null, appointment);
       return sendCreated(res, appointment, 'Appointment scheduled successfully');
@@ -88,40 +91,46 @@ export class AppointmentController {
       );
       const { patientId, doctorId, status, type, date, departmentId } = req.query;
 
-      const where: Record<string, unknown> = {};
-      if (patientId) where.patientId = patientId;
-      if (doctorId) where.doctorId = doctorId;
-      if (status) where.status = status;
-      if (type) where.type = type;
-      if (departmentId) where.departmentId = departmentId;
+      let start: Date | undefined;
+      let end: Date | undefined;
       if (date) {
-        const start = new Date(date as string);
-        const end = new Date(start);
+        start = new Date(date as string);
+        end = new Date(start);
         end.setDate(end.getDate() + 1);
-        where.scheduledAt = { gte: start, lt: end };
       }
 
+      const query = db.orm.public.Appointment.where((appointment) =>
+        and(
+          patientId ? appointment.patientId.eq(patientId as string) : all(),
+          doctorId ? appointment.doctorId.eq(doctorId as string) : all(),
+          status ? appointment.status.eq(status as AppointmentStatus) : all(),
+          type ? appointment.type.eq(type as AppointmentType) : all(),
+          departmentId ? appointment.departmentId.eq(departmentId as string) : all(),
+          start && end
+            ? and(
+                appointment.scheduledAt.gte(toTimestampString(start)),
+                appointment.scheduledAt.lt(toTimestampString(end))
+              )
+            : all()
+        )
+      );
       const [total, appointments] = await Promise.all([
-        prisma.appointment.count({ where }),
-        prisma.appointment.findMany({
-          where,
-          skip,
-          take: limit,
-          orderBy: { scheduledAt: 'asc' },
-          include: {
-            patient: { select: { firstName: true, lastName: true, patientId: true, phone: true } },
-            doctor: {
-              include: {
-                staff: { select: { firstName: true, lastName: true } },
-                specialization: true,
-              },
-            },
-            department: { select: { name: true } },
-          },
-        }),
+        query.aggregate((aggregate) => ({ total: aggregate.count() })),
+        query
+          .include('patient', (patient) => patient.select('firstName', 'lastName', 'patientId', 'phone'))
+          .include('doctor', (doctor) =>
+            doctor
+              .include('staff', (staff) => staff.select('firstName', 'lastName'))
+              .include('specialization')
+          )
+          .include('department', (department) => department.select('name'))
+          .orderBy((appointment) => appointment.scheduledAt.asc())
+          .offset(skip)
+          .limit(limit)
+          .all(),
       ]);
 
-      return sendSuccess(res, appointments, 'Appointments retrieved', 200, buildPaginationMeta(total, page, limit));
+      return sendSuccess(res, appointments, 'Appointments retrieved', 200, buildPaginationMeta(total.total, page, limit));
     } catch (error) {
       next(error);
     }
@@ -133,24 +142,15 @@ export class AppointmentController {
   static async findOne(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      const appointment = await prisma.appointment.findFirst({
-        where: { OR: [{ id }, { appointmentNo: id }] },
-        include: {
-          patient: true,
-          doctor: {
-            include: {
-              staff: true,
-              specialization: true,
-            },
-          },
-          department: true,
-          medicalRecord: {
-            include: { diagnoses: true, vitalSigns: true },
-          },
-          followUps: true,
-          parentAppointment: true,
-        },
-      });
+      const appointment = await db.orm.public.Appointment
+        .include('patient')
+        .include('doctor', (doctor) => doctor.include('staff').include('specialization'))
+        .include('department')
+        .include('medicalRecord', (record) => record.include('diagnoses').include('vitalSigns'))
+        .include('followUps')
+        .include('parentAppointment')
+        .where((record) => or(record.id.eq(id), record.appointmentNo.eq(id)))
+        .first();
 
       if (!appointment) throw new NotFoundError('Appointment not found');
       return sendSuccess(res, appointment);
@@ -167,27 +167,23 @@ export class AppointmentController {
       const { id } = req.params;
       const { status, cancellationReason } = req.body;
 
-      const appointment = await prisma.appointment.findFirst({
-        where: { OR: [{ id }, { appointmentNo: id }] },
-      });
+      const appointment = await findAppointment(id);
       if (!appointment) throw new NotFoundError('Appointment not found');
 
       const updateData: Record<string, unknown> = { status };
-      if (status === AppointmentStatus.CHECKED_IN) updateData.checkedInAt = new Date();
-      if (status === AppointmentStatus.COMPLETED) updateData.completedAt = new Date();
+      if (status === AppointmentStatus.CHECKED_IN) updateData.checkedInAt = toTimestampString(new Date());
+      if (status === AppointmentStatus.COMPLETED) updateData.completedAt = toTimestampString(new Date());
       if (status === AppointmentStatus.CANCELLED) {
-        updateData.cancelledAt = new Date();
+        updateData.cancelledAt = toTimestampString(new Date());
         updateData.cancellationReason = cancellationReason;
       }
 
-      const updated = await prisma.appointment.update({
-        where: { id: appointment.id },
-        data: updateData,
-        include: {
-          patient: { select: { firstName: true, lastName: true } },
-          doctor: { include: { staff: { select: { firstName: true, lastName: true } } } },
-        },
-      });
+      const updated = await db.orm.public.Appointment
+        .include('patient', (patient) => patient.select('firstName', 'lastName'))
+        .include('doctor', (doctor) => doctor.include('staff', (staff) => staff.select('firstName', 'lastName')))
+        .where({ id: appointment.id })
+        .update(updateData as { status: AppointmentStatus });
+      if (!updated) throw new NotFoundError('Appointment not found');
 
       await logAudit(req.user?.userId, `APPOINTMENT_${status}`, 'appointment', appointment.id);
       return sendSuccess(res, updated, `Appointment ${status.toLowerCase()}`);
@@ -204,9 +200,7 @@ export class AppointmentController {
       const { id } = req.params;
       const { scheduledAt, duration } = req.body;
 
-      const appointment = await prisma.appointment.findFirst({
-        where: { OR: [{ id }, { appointmentNo: id }] },
-      });
+      const appointment = await findAppointment(id);
       if (!appointment) throw new NotFoundError('Appointment not found');
 
       if (
@@ -216,14 +210,12 @@ export class AppointmentController {
         throw new AppError('Cannot reschedule a completed or cancelled appointment', 400);
       }
 
-      const updated = await prisma.appointment.update({
-        where: { id: appointment.id },
-        data: {
-          scheduledAt: new Date(scheduledAt),
+      const updated = await db.orm.public.Appointment.where({ id: appointment.id }).update({
+          scheduledAt: toTimestampString(new Date(scheduledAt)),
           duration: duration || appointment.duration,
           status: AppointmentStatus.RESCHEDULED,
-        },
       });
+      if (!updated) throw new NotFoundError('Appointment not found');
 
       await logAudit(req.user?.userId, 'RESCHEDULE', 'appointment', appointment.id);
       return sendSuccess(res, updated, 'Appointment rescheduled');
@@ -240,24 +232,28 @@ export class AppointmentController {
       const { doctorId } = req.params;
       const { date } = req.query;
 
-      const doctor = await prisma.doctor.findFirst({
-        where: { OR: [{ id: doctorId }, { staff: { staffId: doctorId } }] },
-      });
+      const doctor = await db.orm.public.Doctor.where((record) =>
+        or(record.id.eq(doctorId), record.staff.some({ staffId: doctorId }))
+      ).first();
       if (!doctor) throw new NotFoundError('Doctor not found');
 
       const queryDate = date ? new Date(date as string) : new Date();
       const startOfDay = new Date(queryDate.setHours(0, 0, 0, 0));
       const endOfDay = new Date(queryDate.setHours(23, 59, 59, 999));
 
-      const appointments = await prisma.appointment.findMany({
-        where: {
-          doctorId: doctor.id,
-          scheduledAt: { gte: startOfDay, lte: endOfDay },
-          status: { notIn: [AppointmentStatus.CANCELLED, AppointmentStatus.NO_SHOW] },
-        },
-        orderBy: { scheduledAt: 'asc' },
-        select: { scheduledAt: true, duration: true, status: true },
-      });
+      const appointments = await db.orm.public.Appointment
+        .select('scheduledAt', 'duration', 'status')
+        .where((appointment) =>
+          and(
+            appointment.doctorId.eq(doctor.id),
+            appointment.scheduledAt.gte(toTimestampString(startOfDay)),
+            appointment.scheduledAt.lte(toTimestampString(endOfDay)),
+            appointment.status.neq(AppointmentStatus.CANCELLED),
+            appointment.status.neq(AppointmentStatus.NO_SHOW)
+          )
+        )
+        .orderBy((appointment) => appointment.scheduledAt.asc())
+        .all();
 
       return sendSuccess(res, { doctorId: doctor.id, date: startOfDay, appointments });
     } catch (error) {
