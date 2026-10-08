@@ -1,10 +1,18 @@
 import { Request, Response, NextFunction } from 'express';
-import { prisma } from '../config/database';
-import { NotFoundError } from '../utils/errors';
+import { db } from '../config/database';
+import { all, and, or } from '@prisma/orm-postgres/orm-client';
+import type { TimestampString } from '@prisma/orm-postgres/target/codec-types';
+import { AppError, NotFoundError } from '../utils/errors';
 import { sendSuccess, sendCreated, getPaginationParams, buildPaginationMeta } from '../utils/response';
 import { generateBillNo, generatePaymentNo } from '../utils/helpers';
 import { logAudit } from '../middleware/audit.middleware';
 import { BillStatus } from '@prisma/client';
+
+const toTimestampString = (value: Date): TimestampString<3> =>
+  value.toISOString() as TimestampString<3>;
+
+const findBill = (id: string) =>
+  db.orm.public.Bill.where((bill) => or(bill.id.eq(id), bill.billNo.eq(id))).first();
 
 export class BillingController {
   /**
@@ -14,9 +22,9 @@ export class BillingController {
     try {
       const { patientId, admissionId, items, notes, dueDate, discountAmount = 0, taxAmount = 0 } = req.body;
 
-      const patient = await prisma.patient.findFirst({
-        where: { OR: [{ id: patientId }, { patientId }] },
-      });
+      const patient = await db.orm.public.Patient.where((record) =>
+        or(record.id.eq(patientId), record.patientId.eq(patientId))
+      ).first();
       if (!patient) throw new NotFoundError('Patient not found');
 
       const totalAmount = items.reduce(
@@ -25,8 +33,7 @@ export class BillingController {
       );
       const netAmount = totalAmount - discountAmount + taxAmount;
 
-      const bill = await prisma.bill.create({
-        data: {
+      const created = await db.orm.public.Bill.create({
           billNo: generateBillNo(),
           patientId: patient.id,
           admissionId,
@@ -36,9 +43,8 @@ export class BillingController {
           netAmount,
           balanceAmount: netAmount,
           notes,
-          dueDate: dueDate ? new Date(dueDate) : undefined,
-          items: {
-            create: items.map((item: {
+          dueDate: dueDate ? toTimestampString(new Date(dueDate)) : undefined,
+          items: (billItems) => billItems.create(items.map((item: {
               description: string; category: string;
               quantity: number; unitPrice: number; discount?: number; notes?: string;
             }) => ({
@@ -49,14 +55,14 @@ export class BillingController {
               totalPrice: item.quantity * item.unitPrice,
               discount: item.discount || 0,
               notes: item.notes,
-            })),
-          },
-        },
-        include: {
-          patient: { select: { firstName: true, lastName: true, patientId: true } },
-          items: true,
-        },
+            }))),
       });
+      const bill = await db.orm.public.Bill
+        .include('patient', (record) => record.select('firstName', 'lastName', 'patientId'))
+        .include('items')
+        .where({ id: created.id })
+        .first();
+      if (!bill) throw new NotFoundError('Bill could not be created');
 
       await logAudit(req.user?.userId, 'CREATE_BILL', 'bill', bill.id, null, bill);
       return sendCreated(res, bill, 'Bill created');
@@ -73,23 +79,26 @@ export class BillingController {
       );
       const { patientId, status } = req.query;
 
-      const where: Record<string, unknown> = {};
-      if (patientId) where.patientId = patientId;
-      if (status) where.status = status;
+      const query = db.orm.public.Bill.where((bill) =>
+        and(
+          patientId ? bill.patientId.eq(patientId as string) : all(),
+          status ? bill.status.eq(status as BillStatus) : all()
+        )
+      );
 
       const [total, bills] = await Promise.all([
-        prisma.bill.count({ where }),
-        prisma.bill.findMany({
-          where, skip, take: limit, orderBy: { createdAt: 'desc' },
-          include: {
-            patient: { select: { firstName: true, lastName: true, patientId: true } },
-            items: true,
-            payments: true,
-          },
-        }),
+        query.aggregate((aggregate) => ({ total: aggregate.count() })),
+        query
+          .include('patient', (record) => record.select('firstName', 'lastName', 'patientId'))
+          .include('items')
+          .include('payments')
+          .orderBy((bill) => bill.createdAt.desc())
+          .offset(skip)
+          .limit(limit)
+          .all(),
       ]);
 
-      return sendSuccess(res, bills, 'Bills retrieved', 200, buildPaginationMeta(total, page, limit));
+      return sendSuccess(res, bills, 'Bills retrieved', 200, buildPaginationMeta(total.total, page, limit));
     } catch (error) { next(error); }
   }
 
@@ -99,15 +108,13 @@ export class BillingController {
   static async getBill(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      const bill = await prisma.bill.findFirst({
-        where: { OR: [{ id }, { billNo: id }] },
-        include: {
-          patient: true,
-          items: true,
-          payments: true,
-          insurances: { include: { insurance: true } },
-        },
-      });
+      const bill = await db.orm.public.Bill
+        .include('patient')
+        .include('items')
+        .include('payments')
+        .include('insurances', (claims) => claims.include('insurance'))
+        .where((record) => or(record.id.eq(id), record.billNo.eq(id)))
+        .first();
       if (!bill) throw new NotFoundError('Bill not found');
       return sendSuccess(res, bill);
     } catch (error) { next(error); }
@@ -121,19 +128,22 @@ export class BillingController {
       const { id } = req.params;
       const { amount, method, reference, notes } = req.body;
 
-      const bill = await prisma.bill.findFirst({
-        where: { OR: [{ id }, { billNo: id }] },
-      });
-      if (!bill) throw new NotFoundError('Bill not found');
+      if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
+        throw new AppError('Payment amount must be a positive number', 400);
+      }
 
-      const newPaid = bill.paidAmount + amount;
-      const newBalance = bill.netAmount - newPaid;
-      const newStatus = newBalance <= 0 ? BillStatus.PAID :
-                        newPaid > 0 ? BillStatus.PARTIAL : bill.status;
+      const payment = await db.transaction(async (tx) => {
+        const bill = await tx.orm.public.Bill.where((record) =>
+          or(record.id.eq(id), record.billNo.eq(id))
+        ).first();
+        if (!bill) throw new NotFoundError('Bill not found');
+        const balance = bill.netAmount - bill.paidAmount;
+        if (amount > balance) throw new AppError('Payment exceeds the outstanding balance', 409);
 
-      const [payment] = await prisma.$transaction([
-        prisma.payment.create({
-          data: {
+        const newPaid = bill.paidAmount + amount;
+        const newBalance = bill.netAmount - newPaid;
+        const newStatus = newBalance <= 0 ? BillStatus.PAID : BillStatus.PARTIAL;
+        const createdPayment = await tx.orm.public.Payment.create({
             paymentNo: generatePaymentNo(),
             billId: bill.id,
             amount,
@@ -141,19 +151,16 @@ export class BillingController {
             reference,
             notes,
             processedBy: req.user?.userId,
-          },
-        }),
-        prisma.bill.update({
-          where: { id: bill.id },
-          data: {
+        });
+        await tx.orm.public.Bill.where({ id: bill.id }).update({
             paidAmount: newPaid,
             balanceAmount: Math.max(0, newBalance),
             status: newStatus,
-          },
-        }),
-      ]);
+        });
+        return createdPayment;
+      });
 
-      await logAudit(req.user?.userId, 'PAYMENT', 'bill', bill.id, null, payment);
+      await logAudit(req.user?.userId, 'PAYMENT', 'bill', payment.billId, null, payment);
       return sendCreated(res, payment, 'Payment recorded');
     } catch (error) { next(error); }
   }
@@ -166,29 +173,23 @@ export class BillingController {
       const { id } = req.params;
       const { insuranceId, claimedAmount, claimNo } = req.body;
 
-      const bill = await prisma.bill.findFirst({
-        where: { OR: [{ id }, { billNo: id }] },
-      });
+      const bill = await findBill(id);
       if (!bill) throw new NotFoundError('Bill not found');
 
-      const insurance = await prisma.insurance.findUnique({ where: { id: insuranceId } });
+      const insurance = await db.orm.public.Insurance.where({ id: insuranceId }).first();
       if (!insurance) throw new NotFoundError('Insurance not found');
 
-      const claim = await prisma.billInsurance.create({
-        data: {
+      const claim = await db.orm.public.BillInsurance
+        .include('insurance')
+        .create({
           billId: bill.id,
           insuranceId,
           claimNo,
           claimedAmount,
-          submittedAt: new Date(),
-        },
-        include: { insurance: true },
+          submittedAt: toTimestampString(new Date()),
       });
 
-      await prisma.bill.update({
-        where: { id: bill.id },
-        data: { status: BillStatus.INSURANCE_PENDING },
-      });
+      await db.orm.public.Bill.where({ id: bill.id }).update({ status: BillStatus.INSURANCE_PENDING });
 
       return sendCreated(res, claim, 'Insurance claim submitted');
     } catch (error) { next(error); }
@@ -203,21 +204,22 @@ export class BillingController {
       const start = startDate ? new Date(startDate as string) : new Date(new Date().setDate(1));
       const end = endDate ? new Date(endDate as string) : new Date();
 
-      const [totalBills, totalRevenue, pendingBills, overdueCount] = await Promise.all([
-        prisma.bill.count({ where: { createdAt: { gte: start, lte: end } } }),
-        prisma.payment.aggregate({
-          where: { processedAt: { gte: start, lte: end } },
-          _sum: { amount: true },
-        }),
-        prisma.bill.count({ where: { status: BillStatus.PENDING } }),
-        prisma.bill.count({ where: { status: BillStatus.OVERDUE } }),
+      const [bills, revenue, pendingBills, overdueCount] = await Promise.all([
+        db.orm.public.Bill.where((bill) =>
+          and(bill.createdAt.gte(toTimestampString(start)), bill.createdAt.lte(toTimestampString(end)))
+        ).aggregate((aggregate) => ({ total: aggregate.count() })),
+        db.orm.public.Payment.where((payment) =>
+          and(payment.processedAt.gte(toTimestampString(start)), payment.processedAt.lte(toTimestampString(end)))
+        ).aggregate((aggregate) => ({ amount: aggregate.sum('amount') })),
+        db.orm.public.Bill.where({ status: BillStatus.PENDING }).aggregate((aggregate) => ({ total: aggregate.count() })),
+        db.orm.public.Bill.where({ status: BillStatus.OVERDUE }).aggregate((aggregate) => ({ total: aggregate.count() })),
       ]);
 
       return sendSuccess(res, {
-        totalBills,
-        totalRevenue: totalRevenue._sum.amount || 0,
-        pendingBills,
-        overdueCount,
+        totalBills: bills.total,
+        totalRevenue: revenue.amount || 0,
+        pendingBills: pendingBills.total,
+        overdueCount: overdueCount.total,
         period: { start, end },
       }, 'Billing stats retrieved');
     } catch (error) { next(error); }
@@ -231,25 +233,21 @@ export class BillingController {
       const { id } = req.params;
       const { discountAmount, notes, dueDate, status } = req.body;
 
-      const bill = await prisma.bill.findFirst({
-        where: { OR: [{ id }, { billNo: id }] },
-      });
+      const bill = await findBill(id);
       if (!bill) throw new NotFoundError('Bill not found');
 
       const updatedDiscount = discountAmount ?? bill.discountAmount;
       const updatedNet = bill.totalAmount - updatedDiscount + bill.taxAmount;
 
-      const updated = await prisma.bill.update({
-        where: { id: bill.id },
-        data: {
+      const updated = await db.orm.public.Bill.where({ id: bill.id }).update({
           discountAmount: updatedDiscount,
           netAmount: updatedNet,
           balanceAmount: updatedNet - bill.paidAmount,
           notes,
-          dueDate: dueDate ? new Date(dueDate) : undefined,
+          dueDate: dueDate ? toTimestampString(new Date(dueDate)) : undefined,
           status,
-        },
       });
+      if (!updated) throw new NotFoundError('Bill not found');
 
       return sendSuccess(res, updated, 'Bill updated');
     } catch (error) { next(error); }
