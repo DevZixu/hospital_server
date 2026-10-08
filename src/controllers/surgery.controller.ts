@@ -1,10 +1,18 @@
 import { Request, Response, NextFunction } from 'express';
-import { prisma } from '../config/database';
+import { db } from '../config/database';
+import { all, and, or } from '@prisma/orm-postgres/orm-client';
+import type { TimestampString } from '@prisma/orm-postgres/target/codec-types';
 import { NotFoundError } from '../utils/errors';
 import { sendSuccess, sendCreated, getPaginationParams, buildPaginationMeta } from '../utils/response';
 import { generateSurgeryNo } from '../utils/helpers';
 import { logAudit } from '../middleware/audit.middleware';
 import { SurgeryStatus } from '@prisma/client';
+
+const toTimestampString = (value: Date): TimestampString<3> =>
+  value.toISOString() as TimestampString<3>;
+
+const findSurgery = (id: string) =>
+  db.orm.public.Surgery.where((surgery) => or(surgery.id.eq(id), surgery.surgeryNo.eq(id))).first();
 
 export class SurgeryController {
   /**
@@ -20,15 +28,14 @@ export class SurgeryController {
       } = req.body;
 
       const [patient, doctor] = await Promise.all([
-        prisma.patient.findFirst({ where: { OR: [{ id: patientId }, { patientId }] } }),
-        prisma.doctor.findUnique({ where: { id: leadSurgeonId } }),
+        db.orm.public.Patient.where((patient) => or(patient.id.eq(patientId), patient.patientId.eq(patientId))).first(),
+        db.orm.public.Doctor.where({ id: leadSurgeonId }).first(),
       ]);
 
       if (!patient) throw new NotFoundError('Patient not found');
       if (!doctor) throw new NotFoundError('Lead surgeon not found');
 
-      const surgery = await prisma.surgery.create({
-        data: {
+      const created = await db.orm.public.Surgery.create({
           surgeryNo: generateSurgeryNo(),
           patientId: patient.id,
           admissionId,
@@ -37,27 +44,26 @@ export class SurgeryController {
           icdProcedureCode,
           priority: priority || 'ELECTIVE',
           operatingRoom,
-          scheduledAt: new Date(scheduledAt),
+          scheduledAt: toTimestampString(new Date(scheduledAt)),
           anesthesiaType,
           anesthesiologist,
           preOpDiagnosis,
           estimatedCost,
           notes,
           staff: staffMembers
-            ? {
-                create: staffMembers.map((s: { staffId: string; role: string }) => ({
+            ? (members) => members.create(staffMembers.map((s: { staffId: string; role: string }) => ({
                   staffId: s.staffId,
                   role: s.role,
-                })),
-              }
+                })))
             : undefined,
-        },
-        include: {
-          patient: { select: { firstName: true, lastName: true, patientId: true } },
-          leadSurgeon: { include: { staff: { select: { firstName: true, lastName: true } } } },
-          staff: { include: { staff: { select: { firstName: true, lastName: true } } } },
-        },
       });
+      const surgery = await db.orm.public.Surgery
+        .include('patient', (patient) => patient.select('firstName', 'lastName', 'patientId'))
+        .include('leadSurgeon', (doctor) => doctor.include('staff', (staff) => staff.select('firstName', 'lastName')))
+        .include('staff', (members) => members.include('staff', (staff) => staff.select('firstName', 'lastName')))
+        .where({ id: created.id })
+        .first();
+      if (!surgery) throw new NotFoundError('Surgery could not be scheduled');
 
       await logAudit(req.user?.userId, 'SCHEDULE_SURGERY', 'surgery', surgery.id, null, surgery);
       return sendCreated(res, surgery, 'Surgery scheduled');
@@ -74,29 +80,36 @@ export class SurgeryController {
       );
       const { patientId, status, priority, date } = req.query;
 
-      const where: Record<string, unknown> = {};
-      if (patientId) where.patientId = patientId;
-      if (status) where.status = status;
-      if (priority) where.priority = priority;
+      let start: Date | undefined;
+      let end: Date | undefined;
       if (date) {
-        const start = new Date(date as string);
-        const end = new Date(start);
+        start = new Date(date as string);
+        end = new Date(start);
         end.setDate(end.getDate() + 1);
-        where.scheduledAt = { gte: start, lt: end };
       }
+      const query = db.orm.public.Surgery.where((surgery) =>
+        and(
+          patientId ? surgery.patientId.eq(patientId as string) : all(),
+          status ? surgery.status.eq(status as SurgeryStatus) : all(),
+          priority ? surgery.priority.eq(priority as 'ELECTIVE' | 'URGENT' | 'EMERGENCY') : all(),
+          start && end
+            ? and(surgery.scheduledAt.gte(toTimestampString(start)), surgery.scheduledAt.lt(toTimestampString(end)))
+            : all()
+        )
+      );
 
       const [total, surgeries] = await Promise.all([
-        prisma.surgery.count({ where }),
-        prisma.surgery.findMany({
-          where, skip, take: limit, orderBy: { scheduledAt: 'asc' },
-          include: {
-            patient: { select: { firstName: true, lastName: true, patientId: true } },
-            leadSurgeon: { include: { staff: { select: { firstName: true, lastName: true } } } },
-          },
-        }),
+        query.aggregate((aggregate) => ({ total: aggregate.count() })),
+        query
+          .include('patient', (patient) => patient.select('firstName', 'lastName', 'patientId'))
+          .include('leadSurgeon', (doctor) => doctor.include('staff', (staff) => staff.select('firstName', 'lastName')))
+          .orderBy((surgery) => surgery.scheduledAt.asc())
+          .offset(skip)
+          .limit(limit)
+          .all(),
       ]);
 
-      return sendSuccess(res, surgeries, 'Surgeries retrieved', 200, buildPaginationMeta(total, page, limit));
+      return sendSuccess(res, surgeries, 'Surgeries retrieved', 200, buildPaginationMeta(total.total, page, limit));
     } catch (error) { next(error); }
   }
 
@@ -106,15 +119,13 @@ export class SurgeryController {
   static async findOne(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      const surgery = await prisma.surgery.findFirst({
-        where: { OR: [{ id }, { surgeryNo: id }] },
-        include: {
-          patient: true,
-          leadSurgeon: { include: { staff: true, specialization: true } },
-          admission: true,
-          staff: { include: { staff: { select: { firstName: true, lastName: true, position: true } } } },
-        },
-      });
+      const surgery = await db.orm.public.Surgery
+        .include('patient')
+        .include('leadSurgeon', (doctor) => doctor.include('staff').include('specialization'))
+        .include('admission')
+        .include('staff', (members) => members.include('staff', (staff) => staff.select('firstName', 'lastName', 'position')))
+        .where((record) => or(record.id.eq(id), record.surgeryNo.eq(id)))
+        .first();
       if (!surgery) throw new NotFoundError('Surgery not found');
       return sendSuccess(res, surgery);
     } catch (error) { next(error); }
@@ -126,15 +137,14 @@ export class SurgeryController {
   static async startSurgery(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      const surgery = await prisma.surgery.findFirst({
-        where: { OR: [{ id }, { surgeryNo: id }] },
-      });
+      const surgery = await findSurgery(id);
       if (!surgery) throw new NotFoundError('Surgery not found');
 
-      const updated = await prisma.surgery.update({
-        where: { id: surgery.id },
-        data: { status: SurgeryStatus.IN_PROGRESS, startedAt: new Date() },
+      const updated = await db.orm.public.Surgery.where({ id: surgery.id }).update({
+        status: SurgeryStatus.IN_PROGRESS,
+        startedAt: toTimestampString(new Date()),
       });
+      if (!updated) throw new NotFoundError('Surgery not found');
 
       return sendSuccess(res, updated, 'Surgery started');
     } catch (error) { next(error); }
@@ -148,28 +158,24 @@ export class SurgeryController {
       const { id } = req.params;
       const { postOpDiagnosis, findings, complications, notes } = req.body;
 
-      const surgery = await prisma.surgery.findFirst({
-        where: { OR: [{ id }, { surgeryNo: id }] },
-      });
+      const surgery = await findSurgery(id);
       if (!surgery) throw new NotFoundError('Surgery not found');
 
       const endedAt = new Date();
       const duration = surgery.startedAt
-        ? Math.floor((endedAt.getTime() - surgery.startedAt.getTime()) / 60000)
+        ? Math.floor((endedAt.getTime() - new Date(surgery.startedAt).getTime()) / 60000)
         : undefined;
 
-      const updated = await prisma.surgery.update({
-        where: { id: surgery.id },
-        data: {
+      const updated = await db.orm.public.Surgery.where({ id: surgery.id }).update({
           status: SurgeryStatus.COMPLETED,
-          endedAt,
+          endedAt: toTimestampString(endedAt),
           duration,
           postOpDiagnosis,
           findings,
           complications,
           notes,
-        },
       });
+      if (!updated) throw new NotFoundError('Surgery not found');
 
       await logAudit(req.user?.userId, 'COMPLETE_SURGERY', 'surgery', surgery.id);
       return sendSuccess(res, updated, 'Surgery completed');
@@ -184,15 +190,14 @@ export class SurgeryController {
       const { id } = req.params;
       const { notes } = req.body;
 
-      const surgery = await prisma.surgery.findFirst({
-        where: { OR: [{ id }, { surgeryNo: id }] },
-      });
+      const surgery = await findSurgery(id);
       if (!surgery) throw new NotFoundError('Surgery not found');
 
-      const updated = await prisma.surgery.update({
-        where: { id: surgery.id },
-        data: { status: SurgeryStatus.CANCELLED, notes },
+      const updated = await db.orm.public.Surgery.where({ id: surgery.id }).update({
+        status: SurgeryStatus.CANCELLED,
+        notes,
       });
+      if (!updated) throw new NotFoundError('Surgery not found');
 
       return sendSuccess(res, updated, 'Surgery cancelled');
     } catch (error) { next(error); }
