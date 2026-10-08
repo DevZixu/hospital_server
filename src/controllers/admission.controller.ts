@@ -1,10 +1,20 @@
 import { Request, Response, NextFunction } from 'express';
-import { prisma } from '../config/database';
+import { db } from '../config/database';
+import { all, and, or } from '@prisma/orm-postgres/orm-client';
+import type { TimestampString } from '@prisma/orm-postgres/target/codec-types';
 import { NotFoundError, AppError } from '../utils/errors';
 import { sendSuccess, sendCreated, getPaginationParams, buildPaginationMeta } from '../utils/response';
 import { generateAdmissionNo } from '../utils/helpers';
 import { logAudit } from '../middleware/audit.middleware';
 import { BedStatus, AdmissionStatus } from '@prisma/client';
+
+const toTimestampString = (value: Date): TimestampString<3> =>
+  value.toISOString() as TimestampString<3>;
+
+const findAdmission = (id: string) =>
+  db.orm.public.Admission.where((admission) =>
+    or(admission.id.eq(id), admission.admissionNo.eq(id))
+  ).first();
 
 export class AdmissionController {
   /**
@@ -17,48 +27,56 @@ export class AdmissionController {
         expectedDischarge, referralSource,
       } = req.body;
 
-      const patient = await prisma.patient.findFirst({
-        where: { OR: [{ id: patientId }, { patientId }] },
-      });
+      const patient = await db.orm.public.Patient.where((record) =>
+        or(record.id.eq(patientId), record.patientId.eq(patientId))
+      ).first();
       if (!patient) throw new NotFoundError('Patient not found');
 
       // Check for existing active admission
-      const activeAdmission = await prisma.admission.findFirst({
-        where: {
-          patientId: patient.id,
-          status: AdmissionStatus.ADMITTED,
-        },
-      });
+      const activeAdmission = await db.orm.public.Admission
+        .where({ patientId: patient.id, status: AdmissionStatus.ADMITTED })
+        .first();
       if (activeAdmission) {
         throw new AppError('Patient already has an active admission', 409);
       }
 
       // Assign bed if specified
-      let bed = null;
       if (bedId) {
-        bed = await prisma.bed.findUnique({ where: { id: bedId } });
+        const bed = await db.orm.public.Bed.where({ id: bedId }).first();
         if (!bed) throw new NotFoundError('Bed not found');
         if (bed.status !== BedStatus.AVAILABLE) {
           throw new AppError('Bed is not available', 409);
         }
-        await prisma.bed.update({ where: { id: bedId }, data: { status: BedStatus.OCCUPIED } });
       }
 
-      const admission = await prisma.admission.create({
-        data: {
+      const admission = await db.transaction(async (tx) => {
+        if (bedId) {
+          const occupiedBed = await tx.orm.public.Bed.where({
+            id: bedId,
+            status: BedStatus.AVAILABLE,
+          }).update({
+            status: BedStatus.OCCUPIED,
+          });
+          if (!occupiedBed) throw new AppError('Bed is no longer available', 409);
+        }
+        const created = await tx.orm.public.Admission.create({
           admissionNo: generateAdmissionNo(),
           patientId: patient.id,
           bedId,
           admittingDoctorId,
           admissionReason,
-          expectedDischarge: expectedDischarge ? new Date(expectedDischarge) : undefined,
+          expectedDischarge: expectedDischarge
+            ? toTimestampString(new Date(expectedDischarge))
+            : undefined,
           referralSource,
-        },
-        include: {
-          patient: { select: { firstName: true, lastName: true, patientId: true } },
-          bed: { include: { ward: true } },
-        },
+        });
+        return tx.orm.public.Admission
+          .include('patient', (record) => record.select('firstName', 'lastName', 'patientId'))
+          .include('bed', (record) => record.include('ward'))
+          .where({ id: created.id })
+          .first();
       });
+      if (!admission) throw new NotFoundError('Admission could not be created');
 
       await logAudit(req.user?.userId, 'ADMIT', 'admission', admission.id, null, admission);
       return sendCreated(res, admission, 'Patient admitted successfully');
@@ -77,26 +95,26 @@ export class AdmissionController {
       );
       const { patientId, status, wardId } = req.query;
 
-      const where: Record<string, unknown> = {};
-      if (patientId) where.patientId = patientId;
-      if (status) where.status = status;
-      if (wardId) where.bed = { wardId };
+      const query = db.orm.public.Admission.where((admission) =>
+        and(
+          patientId ? admission.patientId.eq(patientId as string) : all(),
+          status ? admission.status.eq(status as AdmissionStatus) : all(),
+          wardId ? admission.bed.some({ wardId: wardId as string }) : all()
+        )
+      );
 
       const [total, admissions] = await Promise.all([
-        prisma.admission.count({ where }),
-        prisma.admission.findMany({
-          where,
-          skip,
-          take: limit,
-          orderBy: { admissionDate: 'desc' },
-          include: {
-            patient: { select: { firstName: true, lastName: true, patientId: true, phone: true } },
-            bed: { include: { ward: { select: { name: true, wardCode: true } } } },
-          },
-        }),
+        query.aggregate((aggregate) => ({ total: aggregate.count() })),
+        query
+          .include('patient', (patient) => patient.select('firstName', 'lastName', 'patientId', 'phone'))
+          .include('bed', (bed) => bed.include('ward', (ward) => ward.select('name', 'wardCode')))
+          .orderBy((admission) => admission.admissionDate.desc())
+          .offset(skip)
+          .limit(limit)
+          .all(),
       ]);
 
-      return sendSuccess(res, admissions, 'Admissions retrieved', 200, buildPaginationMeta(total, page, limit));
+      return sendSuccess(res, admissions, 'Admissions retrieved', 200, buildPaginationMeta(total.total, page, limit));
     } catch (error) {
       next(error);
     }
@@ -108,19 +126,19 @@ export class AdmissionController {
   static async findOne(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      const admission = await prisma.admission.findFirst({
-        where: { OR: [{ id }, { admissionNo: id }] },
-        include: {
-          patient: true,
-          bed: { include: { ward: { include: { department: true } } } },
-          medicalRecords: {
-            include: { diagnoses: true, doctor: { include: { staff: { select: { firstName: true, lastName: true } } } } },
-            orderBy: { visitDate: 'desc' },
-          },
-          vitalSigns: { orderBy: { recordedAt: 'desc' }, take: 5 },
-          surgeries: true,
-        },
-      });
+      const admission = await db.orm.public.Admission
+        .include('patient')
+        .include('bed', (bed) => bed.include('ward', (ward) => ward.include('department')))
+        .include('medicalRecords', (records) =>
+          records
+            .include('diagnoses')
+            .include('doctor', (doctor) => doctor.include('staff', (staff) => staff.select('firstName', 'lastName')))
+            .orderBy((record) => record.visitDate.desc())
+        )
+        .include('vitalSigns', (vitals) => vitals.orderBy((vital) => vital.recordedAt.desc()).limit(5))
+        .include('surgeries')
+        .where((record) => or(record.id.eq(id), record.admissionNo.eq(id)))
+        .first();
 
       if (!admission) throw new NotFoundError('Admission not found');
       return sendSuccess(res, admission);
@@ -137,31 +155,25 @@ export class AdmissionController {
       const { id } = req.params;
       const { dischargeNotes } = req.body;
 
-      const admission = await prisma.admission.findFirst({
-        where: { OR: [{ id }, { admissionNo: id }] },
-        include: { bed: true },
-      });
+      const admission = await db.orm.public.Admission
+        .include('bed')
+        .where((record) => or(record.id.eq(id), record.admissionNo.eq(id)))
+        .first();
       if (!admission) throw new NotFoundError('Admission not found');
       if (admission.status === AdmissionStatus.DISCHARGED) {
         throw new AppError('Patient already discharged', 400);
       }
 
-      await prisma.$transaction(async (tx) => {
-        await tx.admission.update({
-          where: { id: admission.id },
-          data: {
+      await db.transaction(async (tx) => {
+        await tx.orm.public.Admission.where({ id: admission.id }).update({
             status: AdmissionStatus.DISCHARGED,
-            dischargeDate: new Date(),
+            dischargeDate: toTimestampString(new Date()),
             dischargeNotes,
-          },
         });
 
         // Free up the bed
         if (admission.bedId) {
-          await tx.bed.update({
-            where: { id: admission.bedId },
-            data: { status: BedStatus.AVAILABLE },
-          });
+          await tx.orm.public.Bed.where({ id: admission.bedId }).update({ status: BedStatus.AVAILABLE });
         }
       });
 
@@ -180,38 +192,39 @@ export class AdmissionController {
       const { id } = req.params;
       const { newBedId, transferNotes } = req.body;
 
-      const admission = await prisma.admission.findFirst({
-        where: { OR: [{ id }, { admissionNo: id }] },
-        include: { bed: true },
-      });
+      const admission = await db.orm.public.Admission
+        .include('bed')
+        .where((record) => or(record.id.eq(id), record.admissionNo.eq(id)))
+        .first();
       if (!admission) throw new NotFoundError('Admission not found');
       if (admission.status !== AdmissionStatus.ADMITTED) {
         throw new AppError('Patient is not currently admitted', 400);
       }
 
-      const newBed = await prisma.bed.findUnique({ where: { id: newBedId } });
+      const newBed = await db.orm.public.Bed.where({ id: newBedId }).first();
       if (!newBed) throw new NotFoundError('New bed not found');
       if (newBed.status !== BedStatus.AVAILABLE) {
         throw new AppError('New bed is not available', 409);
       }
 
-      await prisma.$transaction(async (tx) => {
+      await db.transaction(async (tx) => {
         // Free old bed
         if (admission.bedId) {
-          await tx.bed.update({
-            where: { id: admission.bedId },
-            data: { status: BedStatus.AVAILABLE },
-          });
+          await tx.orm.public.Bed.where({ id: admission.bedId }).update({ status: BedStatus.AVAILABLE });
         }
         // Occupy new bed
-        await tx.bed.update({
-          where: { id: newBedId },
-          data: { status: BedStatus.OCCUPIED },
+        const occupiedBed = await tx.orm.public.Bed.where({
+          id: newBedId,
+          status: BedStatus.AVAILABLE,
+        }).update({
+          status: BedStatus.OCCUPIED,
         });
+        if (!occupiedBed) throw new AppError('New bed is no longer available', 409);
         // Update admission
-        await tx.admission.update({
-          where: { id: admission.id },
-          data: { bedId: newBedId, transferNotes, status: AdmissionStatus.TRANSFERRED },
+        await tx.orm.public.Admission.where({ id: admission.id }).update({
+          bedId: newBedId,
+          transferNotes,
+          status: AdmissionStatus.TRANSFERRED,
         });
       });
 
