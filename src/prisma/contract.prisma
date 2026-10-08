@@ -1,0 +1,1147 @@
+// use prisma-8
+// Printed from prisma/schema.prisma by `prisma contract print`.
+
+namespace public {
+  model User {
+    id                  String                                                    @id @default(uuid())
+    email               String
+    password            String
+    role                pg.enum(Role)
+    isActive            Boolean                                                   @default(true)
+    isEmailVerified     Boolean                                                   @default(false)
+    emailVerifyToken    String?
+    passwordResetToken  String?
+    passwordResetExpiry TimestampString(3)?
+    lastLoginAt         TimestampString(3)?
+    createdAt           TimestampString(3)                                        @default(now())
+    updatedAt           temporal.timestampString(3, onCreate: now, onUpdate: now)
+    auditLogs           AuditLog[]
+    notifications       Notification[]
+    patient             Patient?
+    refreshTokens       RefreshToken[]
+    staff               Staff?
+
+    @@index([email], map: "users_email_key", unique: true)
+    @@map("users")
+  }
+
+  model Staff {
+    id           String                                                    @id @default(uuid())
+    userId       String
+    staffId      String
+    firstName    String
+    lastName     String
+    middleName   String?
+    gender       pg.enum(Gender)
+    dateOfBirth  TimestampString(3)
+    phone        String
+    address      String?
+    city         String?
+    state        String?
+    country      String                                                    @default("NG")
+    departmentId String?
+    position     String?
+    hireDate     TimestampString(3)
+    salary       Float?
+    profilePhoto String?
+    isOnDuty     Boolean                                                   @default(false)
+    createdAt    TimestampString(3)                                        @default(now())
+    updatedAt    temporal.timestampString(3, onCreate: now, onUpdate: now)
+    doctor       Doctor?
+    nurse        Nurse?
+    shifts       Shift[]
+    surgeryStaff SurgeryStaff[]
+    user         User                                                      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade, index: false)
+    department   Department?                                               @relation(name: "Staff_department", fields: [departmentId], references: [id], onDelete: SetNull, onUpdate: Cascade, index: false)
+    headOf       Department[]                                              @relation(name: "Department_head")
+
+    @@index([userId], map: "staff_userId_key", unique: true)
+    @@index([staffId], map: "staff_staffId_key", unique: true)
+    @@map("staff")
+  }
+
+  model Department {
+    id           String                                                    @id @default(uuid())
+    name         String
+    code         String
+    description  String?
+    headId       String?
+    isActive     Boolean                                                   @default(true)
+    createdAt    TimestampString(3)                                        @default(now())
+    updatedAt    temporal.timestampString(3, onCreate: now, onUpdate: now)
+    appointments Appointment[]
+    wards        Ward[]
+    head         Staff?                                                    @relation(name: "Department_head", fields: [headId], references: [id], onDelete: SetNull, onUpdate: Cascade, index: false)
+    staff        Staff[]                                                   @relation(name: "Staff_department")
+
+    @@index([name], map: "departments_name_key", unique: true)
+    @@index([code], map: "departments_code_key", unique: true)
+    @@map("departments")
+  }
+
+  model Ward {
+    id           String                                                    @id @default(uuid())
+    name         String
+    wardCode     String
+    departmentId String?
+    type         pg.enum(BedType)                                          @default("GENERAL")
+    floor        Int?
+    building     String?
+    capacity     Int
+    isActive     Boolean                                                   @default(true)
+    createdAt    TimestampString(3)                                        @default(now())
+    updatedAt    temporal.timestampString(3, onCreate: now, onUpdate: now)
+    beds         Bed[]
+    nurses       Nurse[]
+    department   Department?                                               @relation(fields: [departmentId], references: [id], onDelete: SetNull, onUpdate: Cascade, index: false)
+
+    @@index([wardCode], map: "wards_wardCode_key", unique: true)
+    @@map("wards")
+  }
+
+  model Bed {
+    id         String                                                    @id @default(uuid())
+    bedNumber  String
+    wardId     String
+    type       pg.enum(BedType)                                          @default("GENERAL")
+    status     pg.enum(BedStatus)                                        @default("AVAILABLE")
+    notes      String?
+    createdAt  TimestampString(3)                                        @default(now())
+    updatedAt  temporal.timestampString(3, onCreate: now, onUpdate: now)
+    admissions Admission[]
+    ward       Ward                                                      @relation(fields: [wardId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+
+    @@index([wardId, bedNumber], map: "beds_wardId_bedNumber_key", unique: true)
+    @@map("beds")
+  }
+
+  model Patient {
+    id                String                                                    @id @default(uuid())
+    userId            String?
+    patientId         String
+    firstName         String
+    lastName          String
+    middleName        String?
+    gender            pg.enum(Gender)
+    dateOfBirth       TimestampString(3)
+    phone             String
+    email             String?
+    address           String?
+    city              String?
+    state             String?
+    country           String                                                    @default("NG")
+    bloodGroup        pg.enum(BloodGroup)                                       @default("UNKNOWN")
+    genotype          String?
+    maritalStatus     pg.enum(MaritalStatus)                                    @default("SINGLE")
+    occupation        String?
+    nationality       String?
+    profilePhoto      String?
+    nextOfKinName     String?
+    nextOfKinPhone    String?
+    nextOfKinRelation String?
+    allergies         String[]?                                                 @noCheck(elementNotNull)
+    chronicConditions String[]?                                                 @noCheck(elementNotNull)
+    isDeceased        Boolean                                                   @default(false)
+    deceasedAt        TimestampString(3)?
+    createdAt         TimestampString(3)                                        @default(now())
+    updatedAt         temporal.timestampString(3, onCreate: now, onUpdate: now)
+    admissions        Admission[]
+    appointments      Appointment[]
+    bills             Bill[]
+    documents         MedicalDocument[]
+    emergencyContacts EmergencyContact[]
+    emergencyVisits   EmergencyVisit[]
+    immunizations     Immunization[]
+    insurances        Insurance[]
+    labOrders         LabOrder[]
+    medicalRecords    MedicalRecord[]
+    prescriptions     Prescription[]
+    radiologyOrders   RadiologyOrder[]
+    referrals         Referral[]
+    surgeries         Surgery[]
+    vitalSigns        VitalSign[]
+    user              User?                                                     @relation(fields: [userId], references: [id], onDelete: SetNull, onUpdate: Cascade, index: false)
+
+    @@index([userId], map: "patients_userId_key", unique: true)
+    @@index([patientId], map: "patients_patientId_key", unique: true)
+    @@map("patients")
+  }
+
+  model Admission {
+    id                String                                                    @id @default(uuid())
+    admissionNo       String
+    patientId         String
+    bedId             String?
+    admittingDoctorId String?
+    admissionReason   String
+    admissionDate     TimestampString(3)                                        @default(now())
+    expectedDischarge TimestampString(3)?
+    dischargeDate     TimestampString(3)?
+    dischargeNotes    String?
+    status            pg.enum(AdmissionStatus)                                  @default("ADMITTED")
+    referralSource    String?
+    transferNotes     String?
+    createdAt         TimestampString(3)                                        @default(now())
+    updatedAt         temporal.timestampString(3, onCreate: now, onUpdate: now)
+    medicalRecords    MedicalRecord[]
+    surgeries         Surgery[]
+    vitalSigns        VitalSign[]
+    patient           Patient                                                   @relation(fields: [patientId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+    bed               Bed?                                                      @relation(fields: [bedId], references: [id], onDelete: SetNull, onUpdate: Cascade, index: false)
+
+    @@index([admissionNo], map: "admissions_admissionNo_key", unique: true)
+    @@index([patientId], map: "admissions_patientId_idx")
+    @@map("admissions")
+  }
+
+  model Specialization {
+    id          String   @id @default(uuid())
+    name        String
+    description String?
+    doctors     Doctor[]
+
+    @@index([name], map: "specializations_name_key", unique: true)
+    @@map("specializations")
+  }
+
+  model Doctor {
+    id                String           @id @default(uuid())
+    staffId           String
+    licenseNumber     String
+    specializationId  String?
+    qualification     String
+    experience        Int              @default(0)
+    consultationFee   Float            @default(0)
+    isAvailable       Boolean          @default(true)
+    bio               String?
+    appointments      Appointment[]
+    labOrders         LabOrder[]
+    medicalRecords    MedicalRecord[]
+    prescriptions     Prescription[]
+    radiologyOrders   RadiologyOrder[]
+    surgeries         Surgery[]
+    staff             Staff            @relation(fields: [staffId], references: [id], onDelete: Cascade, onUpdate: Cascade, index: false)
+    specialization    Specialization?  @relation(fields: [specializationId], references: [id], onDelete: SetNull, onUpdate: Cascade, index: false)
+    referrals         Referral[]       @relation(name: "Referral_referringDoctor")
+    referralsReceived Referral[]       @relation(name: "Referral_referredToDoctor")
+
+    @@index([staffId], map: "doctors_staffId_key", unique: true)
+    @@index([licenseNumber], map: "doctors_licenseNumber_key", unique: true)
+    @@map("doctors")
+  }
+
+  model Appointment {
+    id                  String                                                    @id @default(uuid())
+    appointmentNo       String
+    patientId           String
+    doctorId            String
+    departmentId        String?
+    type                pg.enum(AppointmentType)                                  @default("CONSULTATION")
+    status              pg.enum(AppointmentStatus)                                @default("SCHEDULED")
+    scheduledAt         TimestampString(3)
+    duration            Int                                                       @default(30)
+    checkedInAt         TimestampString(3)?
+    completedAt         TimestampString(3)?
+    cancelledAt         TimestampString(3)?
+    cancellationReason  String?
+    chiefComplaint      String?
+    notes               String?
+    isFollowUp          Boolean                                                   @default(false)
+    parentAppointmentId String?
+    createdAt           TimestampString(3)                                        @default(now())
+    updatedAt           temporal.timestampString(3, onCreate: now, onUpdate: now)
+    medicalRecord       MedicalRecord?
+    patient             Patient                                                   @relation(fields: [patientId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+    doctor              Doctor                                                    @relation(fields: [doctorId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+    department          Department?                                               @relation(fields: [departmentId], references: [id], onDelete: SetNull, onUpdate: Cascade, index: false)
+    parentAppointment   Appointment?                                              @relation(name: "Appointment_parentAppointment", fields: [parentAppointmentId], references: [id], onDelete: SetNull, onUpdate: Cascade, index: false)
+    followUps           Appointment[]                                             @relation(name: "Appointment_parentAppointment")
+
+    @@index([appointmentNo], map: "appointments_appointmentNo_key", unique: true)
+    @@index([scheduledAt], map: "appointments_scheduledAt_idx")
+    @@index([patientId], map: "appointments_patientId_idx")
+    @@index([doctorId], map: "appointments_doctorId_idx")
+    @@map("appointments")
+  }
+
+  model AuditLog {
+    id         String             @id @default(uuid())
+    userId     String?
+    action     String
+    resource   String
+    resourceId String?
+    oldValue   Jsonb?
+    newValue   Jsonb?
+    ipAddress  String?
+    userAgent  String?
+    createdAt  TimestampString(3) @default(now())
+    user       User?              @relation(fields: [userId], references: [id], onDelete: SetNull, onUpdate: Cascade, index: false)
+
+    @@index([userId], map: "audit_logs_userId_idx")
+    @@index([resource], map: "audit_logs_resource_idx")
+    @@index([createdAt], map: "audit_logs_createdAt_idx")
+    @@map("audit_logs")
+  }
+
+  model Bill {
+    id             String                                                    @id @default(uuid())
+    billNo         String
+    patientId      String
+    admissionId    String?
+    totalAmount    Float                                                     @default(0)
+    discountAmount Float                                                     @default(0)
+    taxAmount      Float                                                     @default(0)
+    netAmount      Float                                                     @default(0)
+    paidAmount     Float                                                     @default(0)
+    balanceAmount  Float                                                     @default(0)
+    status         pg.enum(BillStatus)                                       @default("PENDING")
+    dueDate        TimestampString(3)?
+    notes          String?
+    createdAt      TimestampString(3)                                        @default(now())
+    updatedAt      temporal.timestampString(3, onCreate: now, onUpdate: now)
+    insurances     BillInsurance[]
+    items          BillItem[]
+    payments       Payment[]
+    patient        Patient                                                   @relation(fields: [patientId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+
+    @@index([billNo], map: "bills_billNo_key", unique: true)
+    @@index([patientId], map: "bills_patientId_idx")
+    @@map("bills")
+  }
+
+  model Insurance {
+    id               String                                                    @id @default(uuid())
+    patientId        String
+    providerName     String
+    policyNumber     String
+    groupNumber      String?
+    memberName       String?
+    memberDob        TimestampString(3)?
+    coverageType     String?
+    coverageAmount   Float?
+    deductible       Float?
+    copay            Float?
+    startDate        TimestampString(3)
+    endDate          TimestampString(3)?
+    status           pg.enum(InsuranceStatus)                                  @default("ACTIVE")
+    isPrimary        Boolean                                                   @default(true)
+    verificationDate TimestampString(3)?
+    verifiedBy       String?
+    createdAt        TimestampString(3)                                        @default(now())
+    updatedAt        temporal.timestampString(3, onCreate: now, onUpdate: now)
+    billInsurances   BillInsurance[]
+    patient          Patient                                                   @relation(fields: [patientId], references: [id], onDelete: Cascade, onUpdate: Cascade, index: false)
+
+    @@map("insurances")
+  }
+
+  model BillInsurance {
+    id             String              @id @default(uuid())
+    billId         String
+    insuranceId    String
+    claimNo        String?
+    claimedAmount  Float?
+    approvedAmount Float?
+    status         String              @default("PENDING")
+    submittedAt    TimestampString(3)?
+    resolvedAt     TimestampString(3)?
+    notes          String?
+    bill           Bill                @relation(fields: [billId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+    insurance      Insurance           @relation(fields: [insuranceId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+
+    @@map("bill_insurances")
+  }
+
+  model BillItem {
+    id          String  @id @default(uuid())
+    billId      String
+    description String
+    category    String
+    quantity    Int     @default(1)
+    unitPrice   Float
+    totalPrice  Float
+    discount    Float   @default(0)
+    notes       String?
+    bill        Bill    @relation(fields: [billId], references: [id], onDelete: Cascade, onUpdate: Cascade, index: false)
+
+    @@map("bill_items")
+  }
+
+  model MedicalRecord {
+    id                      String                                                    @id @default(uuid())
+    recordNo                String
+    patientId               String
+    doctorId                String
+    appointmentId           String?
+    admissionId             String?
+    visitDate               TimestampString(3)                                        @default(now())
+    chiefComplaint          String?
+    historyOfPresentIllness String?
+    pastMedicalHistory      String?
+    familyHistory           String?
+    socialHistory           String?
+    reviewOfSystems         String?
+    physicalExamination     String?
+    assessment              String?
+    plan                    String?
+    followUpDate            TimestampString(3)?
+    followUpNotes           String?
+    isConfidential          Boolean                                                   @default(false)
+    createdAt               TimestampString(3)                                        @default(now())
+    updatedAt               temporal.timestampString(3, onCreate: now, onUpdate: now)
+    diagnoses               Diagnosis[]
+    labOrders               LabOrder[]
+    nurseNotes              NurseNote[]
+    prescriptions           Prescription[]
+    radiologyOrders         RadiologyOrder[]
+    vitalSigns              VitalSign[]
+    patient                 Patient                                                   @relation(fields: [patientId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+    doctor                  Doctor                                                    @relation(fields: [doctorId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+    appointment             Appointment?                                              @relation(fields: [appointmentId], references: [id], onDelete: SetNull, onUpdate: Cascade, index: false)
+    admission               Admission?                                                @relation(fields: [admissionId], references: [id], onDelete: SetNull, onUpdate: Cascade, index: false)
+
+    @@index([recordNo], map: "medical_records_recordNo_key", unique: true)
+    @@index([appointmentId], map: "medical_records_appointmentId_key", unique: true)
+    @@index([patientId], map: "medical_records_patientId_idx")
+    @@map("medical_records")
+  }
+
+  model Diagnosis {
+    id              String             @id @default(uuid())
+    medicalRecordId String
+    icdCode         String?
+    name            String
+    description     String?
+    isPrimary       Boolean            @default(false)
+    diagnosedAt     TimestampString(3) @default(now())
+    medicalRecord   MedicalRecord      @relation(fields: [medicalRecordId], references: [id], onDelete: Cascade, onUpdate: Cascade, index: false)
+
+    @@map("diagnoses")
+  }
+
+  model EmergencyContact {
+    id           String  @id @default(uuid())
+    patientId    String
+    name         String
+    relationship String
+    phone        String
+    email        String?
+    address      String?
+    isPrimary    Boolean @default(false)
+    patient      Patient @relation(fields: [patientId], references: [id], onDelete: Cascade, onUpdate: Cascade, index: false)
+
+    @@map("emergency_contacts")
+  }
+
+  model EmergencyVisit {
+    id               String                                                    @id @default(uuid())
+    visitNo          String
+    patientId        String?
+    walkinName       String?
+    walkinAge        Int?
+    walkinGender     pg.enum(Gender)?
+    triageTime       TimestampString(3)                                        @default(now())
+    chiefComplaint   String
+    priority         pg.enum(EmergencyPriority)                                @default("P3_LESS_URGENT")
+    status           pg.enum(EmergencyStatus)                                  @default("TRIAGED")
+    triageNotes      String?
+    assignedDoctorId String?
+    roomNo           String?
+    vitalSystolic    Int?
+    vitalDiastolic   Int?
+    vitalHR          Int?
+    vitalTemp        Float?
+    vitalO2Sat       Float?
+    vitalRR          Int?
+    treatmentNotes   String?
+    dispositionNotes String?
+    dischargedAt     TimestampString(3)?
+    createdAt        TimestampString(3)                                        @default(now())
+    updatedAt        temporal.timestampString(3, onCreate: now, onUpdate: now)
+    patient          Patient?                                                  @relation(fields: [patientId], references: [id], onDelete: SetNull, onUpdate: Cascade, index: false)
+
+    @@index([visitNo], map: "emergency_visits_visitNo_key", unique: true)
+    @@index([triageTime], map: "emergency_visits_triageTime_idx")
+    @@map("emergency_visits")
+  }
+
+  model HospitalSettings {
+    id          String                                                    @id @default(uuid())
+    key         String
+    value       String
+    description String?
+    updatedBy   String?
+    updatedAt   temporal.timestampString(3, onCreate: now, onUpdate: now)
+
+    @@index([key], map: "hospital_settings_key_key", unique: true)
+    @@map("hospital_settings")
+  }
+
+  model Immunization {
+    id             String              @id @default(uuid())
+    patientId      String
+    vaccineName    String
+    vaccineCode    String?
+    dose           String?
+    route          String?
+    site           String?
+    lotNumber      String?
+    expiryDate     TimestampString(3)?
+    administeredBy String?
+    administeredAt TimestampString(3)  @default(now())
+    nextDoseDate   TimestampString(3)?
+    notes          String?
+    createdAt      TimestampString(3)  @default(now())
+    patient        Patient             @relation(fields: [patientId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+
+    @@index([patientId], map: "immunizations_patientId_idx")
+    @@map("immunizations")
+  }
+
+  model LabOrder {
+    id              String                                                    @id @default(uuid())
+    orderNo         String
+    patientId       String
+    doctorId        String
+    medicalRecordId String?
+    priority        pg.enum(LabTestPriority)                                  @default("ROUTINE")
+    clinicalNotes   String?
+    orderedAt       TimestampString(3)                                        @default(now())
+    createdAt       TimestampString(3)                                        @default(now())
+    updatedAt       temporal.timestampString(3, onCreate: now, onUpdate: now)
+    items           LabOrderItem[]
+    patient         Patient                                                   @relation(fields: [patientId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+    doctor          Doctor                                                    @relation(fields: [doctorId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+    medicalRecord   MedicalRecord?                                            @relation(fields: [medicalRecordId], references: [id], onDelete: SetNull, onUpdate: Cascade, index: false)
+
+    @@index([orderNo], map: "lab_orders_orderNo_key", unique: true)
+    @@index([patientId], map: "lab_orders_patientId_idx")
+    @@map("lab_orders")
+  }
+
+  model LabTest {
+    id             String                                                    @id @default(uuid())
+    name           String
+    code           String
+    category       String
+    description    String?
+    normalRange    String?
+    unit           String?
+    price          Float
+    turnaroundTime Int?
+    sampleType     String?
+    isActive       Boolean                                                   @default(true)
+    createdAt      TimestampString(3)                                        @default(now())
+    updatedAt      temporal.timestampString(3, onCreate: now, onUpdate: now)
+    orderItems     LabOrderItem[]
+
+    @@index([name], map: "lab_tests_name_key", unique: true)
+    @@index([code], map: "lab_tests_code_key", unique: true)
+    @@map("lab_tests")
+  }
+
+  model LabOrderItem {
+    id                String                 @id @default(uuid())
+    labOrderId        String
+    labTestId         String
+    status            pg.enum(LabTestStatus) @default("ORDERED")
+    sampleCollectedAt TimestampString(3)?
+    sampleCollectedBy String?
+    resultValue       String?
+    resultUnit        String?
+    referenceRange    String?
+    isAbnormal        Boolean?
+    notes             String?
+    reportedAt        TimestampString(3)?
+    reportedBy        String?
+    technicianId      String?
+    labOrder          LabOrder               @relation(fields: [labOrderId], references: [id], onDelete: Cascade, onUpdate: Cascade, index: false)
+    labTest           LabTest                @relation(fields: [labTestId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+
+    @@map("lab_order_items")
+  }
+
+  model MedicalDocument {
+    id             String                @id @default(uuid())
+    patientId      String
+    type           pg.enum(DocumentType)
+    title          String
+    description    String?
+    fileUrl        String
+    fileName       String
+    fileSize       Int?
+    mimeType       String?
+    uploadedBy     String?
+    uploadedAt     TimestampString(3)    @default(now())
+    isConfidential Boolean               @default(false)
+    patient        Patient               @relation(fields: [patientId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+
+    @@index([patientId], map: "medical_documents_patientId_idx")
+    @@map("medical_documents")
+  }
+
+  model Medication {
+    id                   String                                                    @id @default(uuid())
+    name                 String
+    genericName          String?
+    brand                String?
+    category             String?
+    form                 String?
+    strength             String?
+    unit                 String?
+    manufacturer         String?
+    description          String?
+    contraindications    String?
+    sideEffects          String?
+    storageConditions    String?
+    requiresPrescription Boolean                                                   @default(true)
+    isActive             Boolean                                                   @default(true)
+    createdAt            TimestampString(3)                                        @default(now())
+    updatedAt            temporal.timestampString(3, onCreate: now, onUpdate: now)
+    prescriptionItems    PrescriptionItem[]
+    stockItems           PharmacyStock[]
+
+    @@map("medications")
+  }
+
+  model Notification {
+    id        String                    @id @default(uuid())
+    userId    String
+    type      pg.enum(NotificationType)
+    title     String
+    message   String
+    data      Jsonb?
+    isRead    Boolean                   @default(false)
+    readAt    TimestampString(3)?
+    sentVia   String[]?                 @noCheck(elementNotNull)
+    createdAt TimestampString(3)        @default(now())
+    user      User                      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade, index: false)
+
+    @@index([userId], map: "notifications_userId_idx")
+    @@map("notifications")
+  }
+
+  model Nurse {
+    id            String      @id @default(uuid())
+    staffId       String
+    licenseNumber String
+    nurseType     String?
+    wardId        String?
+    nurseNotes    NurseNote[]
+    vitalSigns    VitalSign[]
+    staff         Staff       @relation(fields: [staffId], references: [id], onDelete: Cascade, onUpdate: Cascade, index: false)
+    ward          Ward?       @relation(fields: [wardId], references: [id], onDelete: SetNull, onUpdate: Cascade, index: false)
+
+    @@index([staffId], map: "nurses_staffId_key", unique: true)
+    @@index([licenseNumber], map: "nurses_licenseNumber_key", unique: true)
+    @@map("nurses")
+  }
+
+  model NurseNote {
+    id              String             @id @default(uuid())
+    patientId       String?
+    medicalRecordId String?
+    nurseId         String?
+    note            String
+    noteType        String             @default("GENERAL")
+    recordedAt      TimestampString(3) @default(now())
+    medicalRecord   MedicalRecord?     @relation(fields: [medicalRecordId], references: [id], onDelete: SetNull, onUpdate: Cascade, index: false)
+    nurse           Nurse?             @relation(fields: [nurseId], references: [id], onDelete: SetNull, onUpdate: Cascade, index: false)
+
+    @@map("nurse_notes")
+  }
+
+  model Payment {
+    id          String                 @id @default(uuid())
+    paymentNo   String
+    billId      String
+    amount      Float
+    method      pg.enum(PaymentMethod)
+    reference   String?
+    notes       String?
+    processedBy String?
+    processedAt TimestampString(3)     @default(now())
+    createdAt   TimestampString(3)     @default(now())
+    bill        Bill                   @relation(fields: [billId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+
+    @@index([paymentNo], map: "payments_paymentNo_key", unique: true)
+    @@map("payments")
+  }
+
+  model PharmacyStock {
+    id            String                                                    @id @default(uuid())
+    medicationId  String
+    batchNumber   String
+    quantity      Int
+    reorderLevel  Int                                                       @default(10)
+    purchasePrice Float?
+    sellingPrice  Float
+    expiryDate    TimestampString(3)
+    supplier      String?
+    receivedDate  TimestampString(3)                                        @default(now())
+    createdAt     TimestampString(3)                                        @default(now())
+    updatedAt     temporal.timestampString(3, onCreate: now, onUpdate: now)
+    medication    Medication                                                @relation(fields: [medicationId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+
+    @@map("pharmacy_stock")
+  }
+
+  model Prescription {
+    id              String                                                    @id @default(uuid())
+    prescriptionNo  String
+    patientId       String
+    doctorId        String
+    medicalRecordId String?
+    status          pg.enum(PrescriptionStatus)                               @default("PENDING")
+    prescribedAt    TimestampString(3)                                        @default(now())
+    validUntil      TimestampString(3)?
+    notes           String?
+    isRefillable    Boolean                                                   @default(false)
+    refillCount     Int                                                       @default(0)
+    dispensedAt     TimestampString(3)?
+    dispensedBy     String?
+    createdAt       TimestampString(3)                                        @default(now())
+    updatedAt       temporal.timestampString(3, onCreate: now, onUpdate: now)
+    items           PrescriptionItem[]
+    patient         Patient                                                   @relation(fields: [patientId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+    doctor          Doctor                                                    @relation(fields: [doctorId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+    medicalRecord   MedicalRecord?                                            @relation(fields: [medicalRecordId], references: [id], onDelete: SetNull, onUpdate: Cascade, index: false)
+
+    @@index([prescriptionNo], map: "prescriptions_prescriptionNo_key", unique: true)
+    @@index([patientId], map: "prescriptions_patientId_idx")
+    @@map("prescriptions")
+  }
+
+  model PrescriptionItem {
+    id             String                       @id @default(uuid())
+    prescriptionId String
+    medicationId   String
+    dosage         String
+    route          pg.enum(MedicationRoute)     @default("ORAL")
+    frequency      pg.enum(MedicationFrequency) @default("ONCE_DAILY")
+    duration       Int?
+    durationUnit   String?
+    quantity       Int
+    instructions   String?
+    dispensedQty   Int                          @default(0)
+    prescription   Prescription                 @relation(fields: [prescriptionId], references: [id], onDelete: Cascade, onUpdate: Cascade, index: false)
+    medication     Medication                   @relation(fields: [medicationId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+
+    @@map("prescription_items")
+  }
+
+  model RadiologyOrder {
+    id                 String                                                    @id @default(uuid())
+    orderNo            String
+    patientId          String
+    doctorId           String
+    medicalRecordId    String?
+    modality           pg.enum(ImagingModality)
+    bodyPart           String
+    clinicalIndication String?
+    status             pg.enum(RadiologyStatus)                                  @default("ORDERED")
+    scheduledAt        TimestampString(3)?
+    performedAt        TimestampString(3)?
+    performedBy        String?
+    radiologistId      String?
+    findings           String?
+    impression         String?
+    recommendation     String?
+    reportedAt         TimestampString(3)?
+    imageUrls          String[]?                                                 @noCheck(elementNotNull)
+    price              Float?
+    createdAt          TimestampString(3)                                        @default(now())
+    updatedAt          temporal.timestampString(3, onCreate: now, onUpdate: now)
+    patient            Patient                                                   @relation(fields: [patientId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+    doctor             Doctor                                                    @relation(fields: [doctorId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+    medicalRecord      MedicalRecord?                                            @relation(fields: [medicalRecordId], references: [id], onDelete: SetNull, onUpdate: Cascade, index: false)
+
+    @@index([orderNo], map: "radiology_orders_orderNo_key", unique: true)
+    @@index([patientId], map: "radiology_orders_patientId_idx")
+    @@map("radiology_orders")
+  }
+
+  model Referral {
+    id                 String                                                    @id @default(uuid())
+    referralNo         String
+    patientId          String
+    referringDoctorId  String
+    referredToDoctorId String?
+    referredToFacility String?
+    reason             String
+    urgency            String                                                    @default("ROUTINE")
+    notes              String?
+    status             String                                                    @default("PENDING")
+    referredAt         TimestampString(3)                                        @default(now())
+    acceptedAt         TimestampString(3)?
+    completedAt        TimestampString(3)?
+    createdAt          TimestampString(3)                                        @default(now())
+    updatedAt          temporal.timestampString(3, onCreate: now, onUpdate: now)
+    patient            Patient                                                   @relation(fields: [patientId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+    referringDoctor    Doctor                                                    @relation(name: "Referral_referringDoctor", fields: [referringDoctorId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+    referredToDoctor   Doctor?                                                   @relation(name: "Referral_referredToDoctor", fields: [referredToDoctorId], references: [id], onDelete: SetNull, onUpdate: Cascade, index: false)
+
+    @@index([referralNo], map: "referrals_referralNo_key", unique: true)
+    @@map("referrals")
+  }
+
+  model RefreshToken {
+    id        String             @id @default(uuid())
+    token     String
+    userId    String
+    expiresAt TimestampString(3)
+    createdAt TimestampString(3) @default(now())
+    user      User               @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade, index: false)
+
+    @@index([token], map: "refresh_tokens_token_key", unique: true)
+    @@map("refresh_tokens")
+  }
+
+  model Shift {
+    id        String             @id @default(uuid())
+    staffId   String
+    shiftType pg.enum(ShiftType)
+    startTime TimestampString(3)
+    endTime   TimestampString(3)
+    isActual  Boolean            @default(false)
+    notes     String?
+    createdAt TimestampString(3) @default(now())
+    staff     Staff              @relation(fields: [staffId], references: [id], onDelete: Cascade, onUpdate: Cascade, index: false)
+
+    @@index([staffId], map: "shifts_staffId_idx")
+    @@index([startTime], map: "shifts_startTime_idx")
+    @@map("shifts")
+  }
+
+  model Surgery {
+    id               String                                                    @id @default(uuid())
+    surgeryNo        String
+    patientId        String
+    admissionId      String?
+    leadSurgeonId    String
+    procedureName    String
+    icdProcedureCode String?
+    priority         pg.enum(SurgeryPriority)                                  @default("ELECTIVE")
+    status           pg.enum(SurgeryStatus)                                    @default("SCHEDULED")
+    operatingRoom    String?
+    scheduledAt      TimestampString(3)
+    startedAt        TimestampString(3)?
+    endedAt          TimestampString(3)?
+    duration         Int?
+    anesthesiaType   String?
+    anesthesiologist String?
+    preOpDiagnosis   String?
+    postOpDiagnosis  String?
+    findings         String?
+    complications    String?
+    notes            String?
+    estimatedCost    Float?
+    createdAt        TimestampString(3)                                        @default(now())
+    updatedAt        temporal.timestampString(3, onCreate: now, onUpdate: now)
+    staff            SurgeryStaff[]
+    patient          Patient                                                   @relation(fields: [patientId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+    admission        Admission?                                                @relation(fields: [admissionId], references: [id], onDelete: SetNull, onUpdate: Cascade, index: false)
+    leadSurgeon      Doctor                                                    @relation(fields: [leadSurgeonId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+
+    @@index([surgeryNo], map: "surgeries_surgeryNo_key", unique: true)
+    @@index([patientId], map: "surgeries_patientId_idx")
+    @@map("surgeries")
+  }
+
+  model SurgeryStaff {
+    id        String  @id @default(uuid())
+    surgeryId String
+    staffId   String
+    role      String
+    surgery   Surgery @relation(fields: [surgeryId], references: [id], onDelete: Cascade, onUpdate: Cascade, index: false)
+    staff     Staff   @relation(fields: [staffId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+
+    @@map("surgery_staff")
+  }
+
+  model VitalSign {
+    id                     String             @id @default(uuid())
+    patientId              String
+    medicalRecordId        String?
+    admissionId            String?
+    nurseId                String?
+    bloodPressureSystolic  Int?
+    bloodPressureDiastolic Int?
+    heartRate              Int?
+    temperature            Float?
+    temperatureUnit        String             @default("C")
+    respiratoryRate        Int?
+    oxygenSaturation       Float?
+    weight                 Float?
+    weightUnit             String             @default("kg")
+    height                 Float?
+    heightUnit             String             @default("cm")
+    bmi                    Float?
+    bloodGlucose           Float?
+    bloodGlucoseUnit       String             @default("mg/dL")
+    painScale              Int?
+    notes                  String?
+    recordedAt             TimestampString(3) @default(now())
+    patient                Patient            @relation(fields: [patientId], references: [id], onDelete: Restrict, onUpdate: Cascade, index: false)
+    medicalRecord          MedicalRecord?     @relation(fields: [medicalRecordId], references: [id], onDelete: SetNull, onUpdate: Cascade, index: false)
+    admission              Admission?         @relation(fields: [admissionId], references: [id], onDelete: SetNull, onUpdate: Cascade, index: false)
+    nurse                  Nurse?             @relation(fields: [nurseId], references: [id], onDelete: SetNull, onUpdate: Cascade, index: false)
+
+    @@index([patientId], map: "vital_signs_patientId_idx")
+    @@map("vital_signs")
+  }
+
+  native_enum Role {
+    SUPER_ADMIN = "SUPER_ADMIN"
+    ADMIN = "ADMIN"
+    DOCTOR = "DOCTOR"
+    NURSE = "NURSE"
+    PHARMACIST = "PHARMACIST"
+    LAB_TECHNICIAN = "LAB_TECHNICIAN"
+    RECEPTIONIST = "RECEPTIONIST"
+    BILLING_STAFF = "BILLING_STAFF"
+    RADIOLOGIST = "RADIOLOGIST"
+    PATIENT = "PATIENT"
+  }
+
+  native_enum Gender {
+    MALE = "MALE"
+    FEMALE = "FEMALE"
+    OTHER = "OTHER"
+  }
+
+  native_enum BloodGroup {
+    A_POSITIVE = "A_POSITIVE"
+    A_NEGATIVE = "A_NEGATIVE"
+    B_POSITIVE = "B_POSITIVE"
+    B_NEGATIVE = "B_NEGATIVE"
+    AB_POSITIVE = "AB_POSITIVE"
+    AB_NEGATIVE = "AB_NEGATIVE"
+    O_POSITIVE = "O_POSITIVE"
+    O_NEGATIVE = "O_NEGATIVE"
+    UNKNOWN = "UNKNOWN"
+  }
+
+  native_enum MaritalStatus {
+    SINGLE = "SINGLE"
+    MARRIED = "MARRIED"
+    DIVORCED = "DIVORCED"
+    WIDOWED = "WIDOWED"
+    SEPARATED = "SEPARATED"
+  }
+
+  native_enum AppointmentStatus {
+    SCHEDULED = "SCHEDULED"
+    CONFIRMED = "CONFIRMED"
+    CHECKED_IN = "CHECKED_IN"
+    IN_PROGRESS = "IN_PROGRESS"
+    COMPLETED = "COMPLETED"
+    CANCELLED = "CANCELLED"
+    NO_SHOW = "NO_SHOW"
+    RESCHEDULED = "RESCHEDULED"
+  }
+
+  native_enum AppointmentType {
+    CONSULTATION = "CONSULTATION"
+    FOLLOW_UP = "FOLLOW_UP"
+    EMERGENCY = "EMERGENCY"
+    ROUTINE_CHECKUP = "ROUTINE_CHECKUP"
+    SURGERY_PRE_OP = "SURGERY_PRE_OP"
+    SURGERY_POST_OP = "SURGERY_POST_OP"
+    TELEMEDICINE = "TELEMEDICINE"
+    LAB_REVIEW = "LAB_REVIEW"
+    VACCINATION = "VACCINATION"
+    PHYSICAL_THERAPY = "PHYSICAL_THERAPY"
+  }
+
+  native_enum AdmissionStatus {
+    PENDING = "PENDING"
+    ADMITTED = "ADMITTED"
+    TRANSFERRED = "TRANSFERRED"
+    DISCHARGED = "DISCHARGED"
+    DECEASED = "DECEASED"
+  }
+
+  native_enum BedType {
+    GENERAL = "GENERAL"
+    PRIVATE = "PRIVATE"
+    ICU = "ICU"
+    NICU = "NICU"
+    EMERGENCY = "EMERGENCY"
+    ISOLATION = "ISOLATION"
+    MATERNITY = "MATERNITY"
+    PEDIATRIC = "PEDIATRIC"
+    SURGICAL = "SURGICAL"
+  }
+
+  native_enum BedStatus {
+    AVAILABLE = "AVAILABLE"
+    OCCUPIED = "OCCUPIED"
+    MAINTENANCE = "MAINTENANCE"
+    RESERVED = "RESERVED"
+  }
+
+  native_enum PrescriptionStatus {
+    PENDING = "PENDING"
+    DISPENSED = "DISPENSED"
+    PARTIALLY_DISPENSED = "PARTIALLY_DISPENSED"
+    CANCELLED = "CANCELLED"
+    EXPIRED = "EXPIRED"
+  }
+
+  native_enum MedicationRoute {
+    ORAL = "ORAL"
+    INTRAVENOUS = "INTRAVENOUS"
+    INTRAMUSCULAR = "INTRAMUSCULAR"
+    SUBCUTANEOUS = "SUBCUTANEOUS"
+    TOPICAL = "TOPICAL"
+    INHALATION = "INHALATION"
+    RECTAL = "RECTAL"
+    SUBLINGUAL = "SUBLINGUAL"
+    NASAL = "NASAL"
+    OPHTHALMIC = "OPHTHALMIC"
+    OTIC = "OTIC"
+    TRANSDERMAL = "TRANSDERMAL"
+  }
+
+  native_enum MedicationFrequency {
+    ONCE_DAILY = "ONCE_DAILY"
+    TWICE_DAILY = "TWICE_DAILY"
+    THREE_TIMES_DAILY = "THREE_TIMES_DAILY"
+    FOUR_TIMES_DAILY = "FOUR_TIMES_DAILY"
+    EVERY_6_HOURS = "EVERY_6_HOURS"
+    EVERY_8_HOURS = "EVERY_8_HOURS"
+    EVERY_12_HOURS = "EVERY_12_HOURS"
+    AS_NEEDED = "AS_NEEDED"
+    WEEKLY = "WEEKLY"
+    BIWEEKLY = "BIWEEKLY"
+    MONTHLY = "MONTHLY"
+    STAT = "STAT"
+  }
+
+  native_enum LabTestStatus {
+    ORDERED = "ORDERED"
+    SAMPLE_COLLECTED = "SAMPLE_COLLECTED"
+    IN_PROGRESS = "IN_PROGRESS"
+    COMPLETED = "COMPLETED"
+    CANCELLED = "CANCELLED"
+    REJECTED = "REJECTED"
+  }
+
+  native_enum LabTestPriority {
+    ROUTINE = "ROUTINE"
+    URGENT = "URGENT"
+    STAT = "STAT"
+  }
+
+  native_enum BillStatus {
+    PENDING = "PENDING"
+    PARTIAL = "PARTIAL"
+    PAID = "PAID"
+    OVERDUE = "OVERDUE"
+    CANCELLED = "CANCELLED"
+    REFUNDED = "REFUNDED"
+    INSURANCE_PENDING = "INSURANCE_PENDING"
+  }
+
+  native_enum PaymentMethod {
+    CASH = "CASH"
+    CARD = "CARD"
+    BANK_TRANSFER = "BANK_TRANSFER"
+    INSURANCE = "INSURANCE"
+    MOBILE_PAYMENT = "MOBILE_PAYMENT"
+    CHECK = "CHECK"
+  }
+
+  native_enum SurgeryStatus {
+    SCHEDULED = "SCHEDULED"
+    IN_PROGRESS = "IN_PROGRESS"
+    COMPLETED = "COMPLETED"
+    CANCELLED = "CANCELLED"
+    POSTPONED = "POSTPONED"
+  }
+
+  native_enum SurgeryPriority {
+    ELECTIVE = "ELECTIVE"
+    URGENT = "URGENT"
+    EMERGENCY = "EMERGENCY"
+  }
+
+  native_enum EmergencyPriority {
+    P1_IMMEDIATE = "P1_IMMEDIATE"
+    P2_URGENT = "P2_URGENT"
+    P3_LESS_URGENT = "P3_LESS_URGENT"
+    P4_NON_URGENT = "P4_NON_URGENT"
+  }
+
+  native_enum EmergencyStatus {
+    TRIAGED = "TRIAGED"
+    WAITING = "WAITING"
+    IN_TREATMENT = "IN_TREATMENT"
+    ADMITTED = "ADMITTED"
+    TRANSFERRED = "TRANSFERRED"
+    DISCHARGED = "DISCHARGED"
+    DECEASED = "DECEASED"
+  }
+
+  native_enum NotificationType {
+    APPOINTMENT_REMINDER = "APPOINTMENT_REMINDER"
+    APPOINTMENT_CONFIRMED = "APPOINTMENT_CONFIRMED"
+    APPOINTMENT_CANCELLED = "APPOINTMENT_CANCELLED"
+    LAB_RESULT_READY = "LAB_RESULT_READY"
+    PRESCRIPTION_READY = "PRESCRIPTION_READY"
+    BILL_GENERATED = "BILL_GENERATED"
+    BILL_OVERDUE = "BILL_OVERDUE"
+    DISCHARGE_SUMMARY = "DISCHARGE_SUMMARY"
+    EMERGENCY_ALERT = "EMERGENCY_ALERT"
+    GENERAL = "GENERAL"
+  }
+
+  native_enum InsuranceStatus {
+    ACTIVE = "ACTIVE"
+    INACTIVE = "INACTIVE"
+    PENDING_VERIFICATION = "PENDING_VERIFICATION"
+    EXPIRED = "EXPIRED"
+    SUSPENDED = "SUSPENDED"
+  }
+
+  native_enum DocumentType {
+    LAB_REPORT = "LAB_REPORT"
+    RADIOLOGY_REPORT = "RADIOLOGY_REPORT"
+    DISCHARGE_SUMMARY = "DISCHARGE_SUMMARY"
+    CONSENT_FORM = "CONSENT_FORM"
+    INSURANCE_DOCUMENT = "INSURANCE_DOCUMENT"
+    REFERRAL_LETTER = "REFERRAL_LETTER"
+    PRESCRIPTION = "PRESCRIPTION"
+    MEDICAL_CERTIFICATE = "MEDICAL_CERTIFICATE"
+    OTHER = "OTHER"
+  }
+
+  native_enum RadiologyStatus {
+    ORDERED = "ORDERED"
+    SCHEDULED = "SCHEDULED"
+    IN_PROGRESS = "IN_PROGRESS"
+    COMPLETED = "COMPLETED"
+    CANCELLED = "CANCELLED"
+    REPORTED = "REPORTED"
+  }
+
+  native_enum ImagingModality {
+    X_RAY = "X_RAY"
+    CT_SCAN = "CT_SCAN"
+    MRI = "MRI"
+    ULTRASOUND = "ULTRASOUND"
+    ECHO = "ECHO"
+    ECG = "ECG"
+    PET_SCAN = "PET_SCAN"
+    MAMMOGRAPHY = "MAMMOGRAPHY"
+    FLUOROSCOPY = "FLUOROSCOPY"
+  }
+
+  native_enum ShiftType {
+    MORNING = "MORNING"
+    AFTERNOON = "AFTERNOON"
+    NIGHT = "NIGHT"
+    ON_CALL = "ON_CALL"
+  }
+}

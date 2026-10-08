@@ -6,7 +6,7 @@ import { NotFoundError, AppError } from '../utils/errors';
 import { sendSuccess, sendCreated, getPaginationParams, buildPaginationMeta } from '../utils/response';
 import { generateAppointmentNo } from '../utils/helpers';
 import { logAudit } from '../middleware/audit.middleware';
-import { AppointmentStatus, AppointmentType } from '@prisma/client';
+import { AppointmentStatus, AppointmentType } from '../prisma/enums';
 
 const toTimestampString = (value: Date): TimestampString<3> =>
   value.toISOString() as TimestampString<3>;

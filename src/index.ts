@@ -1,6 +1,6 @@
 import { app } from './app';
 import { config } from './config/config';
-import { db, prisma } from './config/database';
+import { db } from './config/database';
 
 const server = app.listen(config.port, () => {
   console.log(`Hospital API listening on port ${config.port}`);
@@ -14,7 +14,7 @@ const shutdown = (signal: string) => {
       process.exitCode = 1;
     }
 
-    await Promise.allSettled([prisma.$disconnect(), db.close()]);
+    await db.close();
     process.exit();
   });
 };

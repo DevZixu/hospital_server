@@ -2,7 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import { db } from '../config/database';
 import { all, and, or } from '@prisma/orm-postgres/orm-client';
 import type { TimestampString } from '@prisma/orm-postgres/target/codec-types';
-import { BloodGroup, Gender } from '@prisma/client';
+import { BloodGroup, Gender } from '../prisma/enums';
 import { NotFoundError } from '../utils/errors';
 import { sendSuccess, sendCreated, getPaginationParams, buildPaginationMeta } from '../utils/response';
 import { generatePatientId } from '../utils/helpers';

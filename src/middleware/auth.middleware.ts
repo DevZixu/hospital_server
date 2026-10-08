@@ -3,7 +3,7 @@ import jwt from 'jsonwebtoken';
 import { config } from '../config/config';
 import { db } from '../config/database';
 import { UnauthorizedError, ForbiddenError } from '../utils/errors';
-import { Role } from '@prisma/client';
+import { Role } from '../prisma/enums';
 
 export interface JwtPayload {
   userId: string;

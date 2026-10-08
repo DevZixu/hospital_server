@@ -6,7 +6,7 @@ import { NotFoundError } from '../utils/errors';
 import { sendSuccess, sendCreated, getPaginationParams, buildPaginationMeta } from '../utils/response';
 import { generateRadiologyOrderNo } from '../utils/helpers';
 import { logAudit } from '../middleware/audit.middleware';
-import { ImagingModality, RadiologyStatus } from '@prisma/client';
+import { ImagingModality, RadiologyStatus } from '../prisma/enums';
 
 const toTimestampString = (value: Date): TimestampString<3> =>
   value.toISOString() as TimestampString<3>;

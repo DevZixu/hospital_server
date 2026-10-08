@@ -8,7 +8,7 @@ import { NotFoundError, ConflictError } from '../utils/errors';
 import { sendSuccess, sendCreated, getPaginationParams, buildPaginationMeta } from '../utils/response';
 import { generateStaffId } from '../utils/helpers';
 import { logAudit } from '../middleware/audit.middleware';
-import { Role } from '@prisma/client';
+import { Role } from '../prisma/enums';
 
 const toTimestampString = (value: Date): TimestampString<3> =>
   value.toISOString() as TimestampString<3>;

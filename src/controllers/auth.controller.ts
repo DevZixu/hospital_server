@@ -6,7 +6,7 @@ import { config } from '../config/config';
 import { AppError, ConflictError, UnauthorizedError, NotFoundError } from '../utils/errors';
 import { sendSuccess, sendCreated } from '../utils/response';
 import { generateToken } from '../utils/helpers';
-import { Role } from '@prisma/client';
+import { Role } from '../prisma/enums';
 import type { TimestampString } from '@prisma/orm-postgres/target/codec-types';
 import { logAudit } from '../middleware/audit.middleware';
 

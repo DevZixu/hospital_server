@@ -10,8 +10,8 @@
     "typecheck": "tsc --noEmit",
     "test": "npm run typecheck",
     "contract:emit": "prisma contract emit",
-    "prisma7:generate": "prisma7 generate",
-    "prisma7:migrate": "prisma7 migrate dev",
+    "prisma8:plan": "prisma migration plan",
+    "prisma8:migrate": "prisma db migrate",
     "prisma8:verify": "prisma db verify"
   },
   "keywords": [],
@@ -19,8 +19,6 @@
   "license": "ISC",
   "type": "module",
   "devDependencies": {
-    "@prisma/cli-engine": "^0.6.3",
-    "@prisma/prisma7": "^7.10.0",
     "@types/bcryptjs": "^2.4.6",
     "@types/cors": "^2.8.19",
     "@types/express": "^4.17.25",
@@ -39,8 +37,6 @@
     "typescript": "^6.0.3"
   },
   "dependencies": {
-    "@prisma/adapter-pg": "^7.10.0",
-    "@prisma/client": "^7.10.0",
     "@prisma/orm-postgres": "^8.0.0-rc.16",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",

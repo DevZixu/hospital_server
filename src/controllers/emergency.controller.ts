@@ -6,7 +6,7 @@ import { NotFoundError } from '../utils/errors';
 import { sendSuccess, sendCreated, getPaginationParams, buildPaginationMeta } from '../utils/response';
 import { generateEmergencyVisitNo } from '../utils/helpers';
 import { logAudit } from '../middleware/audit.middleware';
-import { EmergencyStatus, EmergencyPriority } from '@prisma/client';
+import { EmergencyStatus, EmergencyPriority } from '../prisma/enums';
 
 const toTimestampString = (value: Date): TimestampString<3> =>
   value.toISOString() as TimestampString<3>;
