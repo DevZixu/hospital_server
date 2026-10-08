@@ -1,17 +1,27 @@
 import { Request, Response, NextFunction } from 'express';
-import { prisma } from '../config/database';
-import { NotFoundError } from '../utils/errors';
+import { db } from '../config/database';
+import { all, and, or } from '@prisma/orm-postgres/orm-client';
+import type { TimestampString } from '@prisma/orm-postgres/target/codec-types';
+import { AppError, NotFoundError } from '../utils/errors';
 import { sendSuccess, sendCreated, getPaginationParams, buildPaginationMeta } from '../utils/response';
 import { generatePrescriptionNo } from '../utils/helpers';
 import { logAudit } from '../middleware/audit.middleware';
 import { PrescriptionStatus } from '@prisma/client';
+
+const toTimestampString = (value: Date): TimestampString<3> =>
+  value.toISOString() as TimestampString<3>;
+
+const findPrescription = (id: string) =>
+  db.orm.public.Prescription.where((prescription) =>
+    or(prescription.id.eq(id), prescription.prescriptionNo.eq(id))
+  ).first();
 
 export class PharmacyController {
   // ─── MEDICATIONS ───────────────────────────────────────────────────────
 
   static async createMedication(req: Request, res: Response, next: NextFunction) {
     try {
-      const medication = await prisma.medication.create({ data: req.body });
+      const medication = await db.orm.public.Medication.create(req.body);
       return sendCreated(res, medication, 'Medication created');
     } catch (error) { next(error); }
   }
@@ -23,35 +33,38 @@ export class PharmacyController {
       );
       const { search, category, isActive } = req.query;
 
-      const where: Record<string, unknown> = {};
-      if (search) {
-        where.OR = [
-          { name: { contains: search as string, mode: 'insensitive' } },
-          { genericName: { contains: search as string, mode: 'insensitive' } },
-          { brand: { contains: search as string, mode: 'insensitive' } },
-        ];
-      }
-      if (category) where.category = category;
-      if (isActive !== undefined) where.isActive = isActive === 'true';
+      const pattern = search ? `%${String(search).replace(/[\\%_]/g, '\\$&')}%` : undefined;
+      const query = db.orm.public.Medication.where((medication) =>
+        and(
+          pattern
+            ? or(
+                medication.name.ilike(pattern),
+                medication.genericName.ilike(pattern),
+                medication.brand.ilike(pattern)
+              )
+            : all(),
+          category ? medication.category.eq(category as string) : all(),
+          isActive !== undefined ? medication.isActive.eq(isActive === 'true') : all()
+        )
+      );
 
       const [total, medications] = await Promise.all([
-        prisma.medication.count({ where }),
-        prisma.medication.findMany({
-          where, skip, take: limit, orderBy: { name: 'asc' },
-          include: { stockItems: { where: { quantity: { gt: 0 } } } },
-        }),
+        query.aggregate((aggregate) => ({ total: aggregate.count() })),
+        query
+          .include('stockItems', (stock) => stock.where((item) => item.quantity.gt(0)))
+          .orderBy((medication) => medication.name.asc())
+          .offset(skip)
+          .limit(limit)
+          .all(),
       ]);
 
-      return sendSuccess(res, medications, 'Medications retrieved', 200, buildPaginationMeta(total, page, limit));
+      return sendSuccess(res, medications, 'Medications retrieved', 200, buildPaginationMeta(total.total, page, limit));
     } catch (error) { next(error); }
   }
 
   static async getMedication(req: Request, res: Response, next: NextFunction) {
     try {
-      const med = await prisma.medication.findUnique({
-        where: { id: req.params.id },
-        include: { stockItems: true },
-      });
+      const med = await db.orm.public.Medication.include('stockItems').where({ id: req.params.id }).first();
       if (!med) throw new NotFoundError('Medication not found');
       return sendSuccess(res, med);
     } catch (error) { next(error); }
@@ -59,10 +72,8 @@ export class PharmacyController {
 
   static async updateMedication(req: Request, res: Response, next: NextFunction) {
     try {
-      const med = await prisma.medication.update({
-        where: { id: req.params.id },
-        data: req.body,
-      });
+      const med = await db.orm.public.Medication.where({ id: req.params.id }).update(req.body);
+      if (!med) throw new NotFoundError('Medication not found');
       return sendSuccess(res, med, 'Medication updated');
     } catch (error) { next(error); }
   }
@@ -73,15 +84,12 @@ export class PharmacyController {
     try {
       const { medicationId, batchNumber, quantity, sellingPrice, expiryDate, ...rest } = req.body;
 
-      const med = await prisma.medication.findUnique({ where: { id: medicationId } });
+      const med = await db.orm.public.Medication.where({ id: medicationId }).first();
       if (!med) throw new NotFoundError('Medication not found');
 
-      const stock = await prisma.pharmacyStock.create({
-        data: {
-          medicationId, batchNumber, quantity, sellingPrice,
-          expiryDate: new Date(expiryDate), ...rest,
-        },
-        include: { medication: true },
+      const stock = await db.orm.public.PharmacyStock.include('medication').create({
+        medicationId, batchNumber, quantity, sellingPrice,
+        expiryDate: toTimestampString(new Date(expiryDate)), ...rest,
       });
       return sendCreated(res, stock, 'Stock added');
     } catch (error) { next(error); }
@@ -97,25 +105,24 @@ export class PharmacyController {
       const now = new Date();
       const thirtyDaysFromNow = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
 
-      const where: Record<string, unknown> = {};
-      if (lowStock === 'true') {
-        // Only items at or below reorder level
-        where.quantity = { lte: prisma.pharmacyStock.fields.reorderLevel };
-      }
-      if (expiringSoon === 'true') {
-        where.expiryDate = { lte: thirtyDaysFromNow };
-      }
+      const query = db.orm.public.PharmacyStock.where((stock) =>
+        and(
+          lowStock === 'true' ? stock.quantity.lte(stock.reorderLevel) : all(),
+          expiringSoon === 'true' ? stock.expiryDate.lte(toTimestampString(thirtyDaysFromNow)) : all()
+        )
+      );
 
       const [total, stock] = await Promise.all([
-        prisma.pharmacyStock.count({ where }),
-        prisma.pharmacyStock.findMany({
-          where, skip, take: limit,
-          orderBy: { expiryDate: 'asc' },
-          include: { medication: { select: { name: true, genericName: true, category: true } } },
-        }),
+        query.aggregate((aggregate) => ({ total: aggregate.count() })),
+        query
+          .include('medication', (medication) => medication.select('name', 'genericName', 'category'))
+          .orderBy((item) => item.expiryDate.asc())
+          .offset(skip)
+          .limit(limit)
+          .all(),
       ]);
 
-      return sendSuccess(res, stock, 'Stock retrieved', 200, buildPaginationMeta(total, page, limit));
+      return sendSuccess(res, stock, 'Stock retrieved', 200, buildPaginationMeta(total.total, page, limit));
     } catch (error) { next(error); }
   }
 
@@ -129,24 +136,26 @@ export class PharmacyController {
       } = req.body;
 
       const [patient, doctor] = await Promise.all([
-        prisma.patient.findFirst({ where: { OR: [{ id: patientId }, { patientId }] } }),
-        prisma.doctor.findFirst({ where: { OR: [{ id: doctorId }, { staff: { staffId: doctorId } }] } }),
+        db.orm.public.Patient.where((patient) =>
+          or(patient.id.eq(patientId), patient.patientId.eq(patientId))
+        ).first(),
+        db.orm.public.Doctor.where((doctor) =>
+          or(doctor.id.eq(doctorId), doctor.staff.some({ staffId: doctorId }))
+        ).first(),
       ]);
 
       if (!patient) throw new NotFoundError('Patient not found');
       if (!doctor) throw new NotFoundError('Doctor not found');
 
-      const prescription = await prisma.prescription.create({
-        data: {
+      const created = await db.orm.public.Prescription.create({
           prescriptionNo: generatePrescriptionNo(),
           patientId: patient.id,
           doctorId: doctor.id,
           medicalRecordId,
           notes,
           isRefillable: isRefillable || false,
-          validUntil: validUntil ? new Date(validUntil) : undefined,
-          items: {
-            create: items.map((item: {
+          validUntil: validUntil ? toTimestampString(new Date(validUntil)) : undefined,
+          items: (prescriptionItems) => prescriptionItems.create(items.map((item: {
               medicationId: string; dosage: string; route: string;
               frequency: string; duration?: number; durationUnit?: string;
               quantity: number; instructions?: string;
@@ -159,15 +168,15 @@ export class PharmacyController {
               durationUnit: item.durationUnit,
               quantity: item.quantity,
               instructions: item.instructions,
-            })),
-          },
-        },
-        include: {
-          patient: { select: { firstName: true, lastName: true, patientId: true } },
-          doctor: { include: { staff: { select: { firstName: true, lastName: true } } } },
-          items: { include: { medication: true } },
-        },
+            }))),
       });
+      const prescription = await db.orm.public.Prescription
+        .include('patient', (patient) => patient.select('firstName', 'lastName', 'patientId'))
+        .include('doctor', (doctor) => doctor.include('staff', (staff) => staff.select('firstName', 'lastName')))
+        .include('items', (items) => items.include('medication'))
+        .where({ id: created.id })
+        .first();
+      if (!prescription) throw new NotFoundError('Prescription could not be created');
 
       await logAudit(req.user?.userId, 'PRESCRIBE', 'prescription', prescription.id, null, prescription);
       return sendCreated(res, prescription, 'Prescription created');
@@ -181,38 +190,39 @@ export class PharmacyController {
       );
       const { patientId, doctorId, status } = req.query;
 
-      const where: Record<string, unknown> = {};
-      if (patientId) where.patientId = patientId;
-      if (doctorId) where.doctorId = doctorId;
-      if (status) where.status = status;
+      const query = db.orm.public.Prescription.where((prescription) =>
+        and(
+          patientId ? prescription.patientId.eq(patientId as string) : all(),
+          doctorId ? prescription.doctorId.eq(doctorId as string) : all(),
+          status ? prescription.status.eq(status as PrescriptionStatus) : all()
+        )
+      );
 
       const [total, prescriptions] = await Promise.all([
-        prisma.prescription.count({ where }),
-        prisma.prescription.findMany({
-          where, skip, take: limit, orderBy: { prescribedAt: 'desc' },
-          include: {
-            patient: { select: { firstName: true, lastName: true, patientId: true } },
-            doctor: { include: { staff: { select: { firstName: true, lastName: true } } } },
-            items: { include: { medication: { select: { name: true, genericName: true } } } },
-          },
-        }),
+        query.aggregate((aggregate) => ({ total: aggregate.count() })),
+        query
+          .include('patient', (patient) => patient.select('firstName', 'lastName', 'patientId'))
+          .include('doctor', (doctor) => doctor.include('staff', (staff) => staff.select('firstName', 'lastName')))
+          .include('items', (items) => items.include('medication', (medication) => medication.select('name', 'genericName')))
+          .orderBy((prescription) => prescription.prescribedAt.desc())
+          .offset(skip)
+          .limit(limit)
+          .all(),
       ]);
 
-      return sendSuccess(res, prescriptions, 'Prescriptions retrieved', 200, buildPaginationMeta(total, page, limit));
+      return sendSuccess(res, prescriptions, 'Prescriptions retrieved', 200, buildPaginationMeta(total.total, page, limit));
     } catch (error) { next(error); }
   }
 
   static async getPrescription(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      const prescription = await prisma.prescription.findFirst({
-        where: { OR: [{ id }, { prescriptionNo: id }] },
-        include: {
-          patient: true,
-          doctor: { include: { staff: { select: { firstName: true, lastName: true } } } },
-          items: { include: { medication: true } },
-        },
-      });
+      const prescription = await db.orm.public.Prescription
+        .include('patient')
+        .include('doctor', (doctor) => doctor.include('staff', (staff) => staff.select('firstName', 'lastName')))
+        .include('items', (items) => items.include('medication'))
+        .where((record) => or(record.id.eq(id), record.prescriptionNo.eq(id)))
+        .first();
       if (!prescription) throw new NotFoundError('Prescription not found');
       return sendSuccess(res, prescription);
     } catch (error) { next(error); }
@@ -225,45 +235,64 @@ export class PharmacyController {
   static async dispensePrescription(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      const prescription = await prisma.prescription.findFirst({
-        where: { OR: [{ id }, { prescriptionNo: id }] },
-        include: { items: { include: { medication: { include: { stockItems: true } } } } },
-      });
+      const prescription = await db.orm.public.Prescription
+        .include('items', (items) => items.include('medication', (medication) => medication.include('stockItems')))
+        .where((record) => or(record.id.eq(id), record.prescriptionNo.eq(id)))
+        .first();
 
       if (!prescription) throw new NotFoundError('Prescription not found');
       if (prescription.status === PrescriptionStatus.DISPENSED) {
-        throw new Error('Prescription already dispensed');
+        throw new AppError('Prescription already dispensed', 409);
       }
 
-      // Check stock availability for each item
-      for (const item of prescription.items) {
-        const totalStock = item.medication.stockItems.reduce(
-          (acc, s) => acc + s.quantity, 0
-        );
-        if (totalStock < item.quantity) {
-          throw new Error(`Insufficient stock for ${item.medication.name}`);
+      await db.transaction(async (tx) => {
+        for (const item of prescription.items) {
+          let needed = item.quantity - item.dispensedQty;
+          const stockItems = await tx.orm.public.PharmacyStock
+            .where((stock) =>
+              and(
+                stock.medicationId.eq(item.medicationId),
+                stock.quantity.gt(0),
+                stock.expiryDate.gte(toTimestampString(new Date()))
+              )
+            )
+            .orderBy((stock) => stock.expiryDate.asc())
+            .all();
+
+          for (const stock of stockItems) {
+            if (needed <= 0) break;
+            const dispensed = Math.min(needed, stock.quantity);
+            const updatedStock = await tx.orm.public.PharmacyStock.where({
+              id: stock.id,
+              quantity: stock.quantity,
+            }).update({
+              quantity: stock.quantity - dispensed,
+            });
+            if (!updatedStock) throw new AppError('Stock changed while dispensing; retry the operation', 409);
+            needed -= dispensed;
+          }
+
+          if (needed > 0) {
+            throw new AppError(`Insufficient unexpired stock for ${item.medication?.name || 'medication'}`, 409);
+          }
+          await tx.orm.public.PrescriptionItem.where({ id: item.id }).update({
+            dispensedQty: item.quantity,
+          });
         }
-      }
 
-      // Update prescription status
-      const updated = await prisma.prescription.update({
-        where: { id: prescription.id },
-        data: {
+        await tx.orm.public.Prescription.where({ id: prescription.id }).update({
           status: PrescriptionStatus.DISPENSED,
-          dispensedAt: new Date(),
+          dispensedAt: toTimestampString(new Date()),
           dispensedBy: req.user?.userId,
-          items: {
-            updateMany: {
-              where: { prescriptionId: prescription.id },
-              data: {},
-            },
-          },
-        },
-        include: {
-          patient: { select: { firstName: true, lastName: true } },
-          items: { include: { medication: { select: { name: true } } } },
-        },
+        });
       });
+
+      const updated = await db.orm.public.Prescription
+        .include('patient', (patient) => patient.select('firstName', 'lastName'))
+        .include('items', (items) => items.include('medication', (medication) => medication.select('name')))
+        .where({ id: prescription.id })
+        .first();
+      if (!updated) throw new NotFoundError('Prescription not found');
 
       await logAudit(req.user?.userId, 'DISPENSE', 'prescription', prescription.id);
       return sendSuccess(res, updated, 'Prescription dispensed successfully');
