@@ -230,7 +230,7 @@ export class DepartmentController {
       const departments = await prisma.department.findMany({
         where: { isActive: true },
         include: {
-          head: { include: { staff: { select: { firstName: true, lastName: true } } } },
+          head: { select: { firstName: true, lastName: true } },
           _count: { select: { staff: true, appointments: true } },
         },
       });
@@ -243,7 +243,7 @@ export class DepartmentController {
       const dept = await prisma.department.findFirst({
         where: { OR: [{ id: req.params.id }, { code: req.params.id }] },
         include: {
-          head: { include: { staff: true } },
+          head: true,
           staff: {
             include: {
               user: { select: { role: true } },

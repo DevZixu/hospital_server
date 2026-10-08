@@ -209,7 +209,10 @@ export class AppointmentController {
       });
       if (!appointment) throw new NotFoundError('Appointment not found');
 
-      if ([AppointmentStatus.COMPLETED, AppointmentStatus.CANCELLED].includes(appointment.status)) {
+      if (
+        appointment.status === AppointmentStatus.COMPLETED ||
+        appointment.status === AppointmentStatus.CANCELLED
+      ) {
         throw new AppError('Cannot reschedule a completed or cancelled appointment', 400);
       }
 
