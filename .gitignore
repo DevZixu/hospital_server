@@ -8,3 +8,4 @@ uploads/*
 !.env.example
 *.log
 .DS_Store
+certs/
