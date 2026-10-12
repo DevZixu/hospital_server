@@ -60,7 +60,7 @@ export const authorize = (...roles: Role[]) => {
     if (!req.user) {
       throw new UnauthorizedError();
     }
-    if (!roles.includes(req.user.role)) {
+    if (req.user.role !== Role.SUPER_ADMIN && !roles.includes(req.user.role)) {
       throw new ForbiddenError(
         `Access denied. Required roles: ${roles.join(', ')}`
       );
