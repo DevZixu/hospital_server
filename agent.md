@@ -1,0 +1,1 @@
+You're a systems architect. Let there be admin roles and UI , thta require admin login, let there be staff roles and UI. only the admin can create a staff. Let there be patient roles, whih is the default login. the patient role should take in name and lastname during creation. Also bring up the hospital fronted direcrory from home and make it match the api 

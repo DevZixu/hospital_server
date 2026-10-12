@@ -3,9 +3,9 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { db } from '../config/database';
 import { config } from '../config/config';
-import { AppError, ConflictError, UnauthorizedError, NotFoundError } from '../utils/errors';
+import { AppError, ConflictError, UnauthorizedError, NotFoundError, ValidationError } from '../utils/errors';
 import { sendSuccess, sendCreated } from '../utils/response';
-import { generateToken } from '../utils/helpers';
+import { generateToken, generatePatientId } from '../utils/helpers';
 import { Role } from '../prisma/enums';
 import type { TimestampString } from '@prisma/orm-postgres/target/codec-types';
 import { logAudit } from '../middleware/audit.middleware';
@@ -26,12 +26,19 @@ const signRefreshToken = (userId: string): string =>
 export class AuthController {
   /**
    * POST /auth/register
-   * Register a new user (PATIENT by default, or any role if ADMIN)
+   * Register a new patient (PATIENT is the default role).
+   * Captures first name and last name, and creates the linked patient record.
    */
   static async register(req: Request, res: Response, next: NextFunction) {
     try {
-      const { email, password } = req.body;
+      const { email, password, firstName, lastName, gender, dateOfBirth, phone } = req.body;
       const role = Role.PATIENT;
+
+      const required = ['email', 'password', 'firstName', 'lastName', 'gender', 'dateOfBirth', 'phone'];
+      const missing = required.filter((field) => !req.body[field] || String(req.body[field]).trim() === '');
+      if (missing.length > 0) {
+        throw new ValidationError(`Missing required fields: ${missing.join(', ')}`);
+      }
 
       const existing = await db.orm.public.User.where({ email }).first();
       if (existing) throw new ConflictError('Email already in use');
@@ -39,14 +46,26 @@ export class AuthController {
       const hashed = await bcrypt.hash(password, config.bcrypt.rounds);
       const verifyToken = generateToken();
 
-      const user = await db.orm.public.User.create({
+      const user = await db.transaction(async (tx) => {
+        const createdUser = await tx.orm.public.User.create({
           email,
           password: hashed,
           role,
           emailVerifyToken: verifyToken,
         });
+        await tx.orm.public.Patient.create({
+          userId: createdUser.id,
+          patientId: generatePatientId(),
+          firstName,
+          lastName,
+          gender,
+          dateOfBirth: toTimestampString(new Date(dateOfBirth)),
+          phone,
+        });
+        return createdUser;
+      });
 
-      await logAudit(user.id, 'REGISTER', 'user', user.id, null, { email, role });
+      await logAudit(user.id, 'REGISTER', 'user', user.id, null, { email, role, firstName, lastName });
 
       return sendCreated(res, user, 'Account created successfully');
     } catch (error) {

@@ -3,7 +3,7 @@ import { db } from '../config/database';
 import { all, and, or } from '@prisma/orm-postgres/orm-client';
 import type { TimestampString } from '@prisma/orm-postgres/target/codec-types';
 import { BloodGroup, Gender } from '../prisma/enums';
-import { NotFoundError } from '../utils/errors';
+import { NotFoundError, ValidationError } from '../utils/errors';
 import { sendSuccess, sendCreated, getPaginationParams, buildPaginationMeta } from '../utils/response';
 import { generatePatientId } from '../utils/helpers';
 import { logAudit } from '../middleware/audit.middleware';
@@ -28,6 +28,11 @@ export class PatientController {
         occupation, nationality, nextOfKinName, nextOfKinPhone, nextOfKinRelation,
         allergies, chronicConditions, userId,
       } = req.body;
+
+      if (!firstName || String(firstName).trim() === '' ||
+          !lastName || String(lastName).trim() === '') {
+        throw new ValidationError('First name and last name are required');
+      }
 
       const patientId = generatePatientId();
 
